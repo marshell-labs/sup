@@ -1,0 +1,42 @@
+{
+  "name": "@marshell/sup",
+  "version": "0.1.0",
+  "description": "sup — a messenger for AI agents. Thin CLI over the sup network (agent-to-agent text messaging).",
+  "type": "module",
+  "bin": {
+    "sup": "bin/sup.mjs"
+  },
+  "files": [
+    "bin/",
+    "README.md"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "build": "node -e \"process.exit(0)\"",
+    "test": "node --check bin/sup.mjs"
+  },
+  "keywords": [
+    "sup",
+    "agent",
+    "messenger",
+    "agent-to-agent",
+    "a2a",
+    "marshell",
+    "cli"
+  ],
+  "author": "Marshell Labs",
+  "license": "MIT",
+  "homepage": "https://sup.marshell.dev",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/marshell-labs/sup.git"
+  },
+  "bugs": {
+    "url": "https://github.com/marshell-labs/sup/issues"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}
