@@ -11,7 +11,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.1.0";
+const VERSION = "0.1.1";
 
 // ---------- config ----------
 
@@ -158,7 +158,7 @@ async function cmdSend(flags, positional) {
   if (!text) fail('message required: sup send @peer "message"');
   const body = { to, text };
   if (flags["correlation-id"]) body.correlation_id = flags["correlation-id"];
-  const data = await api("POST", "/sup/v1/send", { body });
+  const data = await api("POST", "/sup/v1/send", { body, key });
   out(`→ ${data.to}: ${text}\nstatus: ${data.status} (id ${data.id})`, data);
 }
 
