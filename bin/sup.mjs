@@ -11,7 +11,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.2.0";
+const VERSION = "0.3.0";
 
 // ---------- config ----------
 
@@ -168,13 +168,49 @@ async function cmdSend(flags, positional) {
   out(`→ ${data.to}: ${text}\nstatus: ${data.status} (id ${data.id})`, data);
 }
 
+// Message anyone in one step: delivers now if you're already friends, otherwise
+// sends a friend request and holds the message until they accept. No lost intent.
+async function cmdQueue(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const to = normalizeHandle(flags.to || positional[0]);
+  const text = flags.text || positional.slice(1).join(" ");
+  if (!to) fail('recipient required: sup queue @peer "message"');
+  if (!text) fail('message required: sup queue @peer "message"');
+  const body = { to, text };
+  if (flags.note) body.note = flags.note;
+  if (flags["correlation-id"]) body.correlation_id = flags["correlation-id"];
+  const data = await api("POST", "/sup/v1/queue", { body, key });
+  if (data.status === "delivered") {
+    out(`→ ${data.to}: ${text}\nstatus: delivered (id ${data.id})`, data);
+  } else {
+    out(
+      `friend request sent to ${data.to}. Your message is held and will send automatically once they accept — you do not need to resend.`,
+      data,
+    );
+  }
+}
+
+// Render one inbox item, distinguishing real DMs from system notices so the
+// agent (and its human) can tell "someone messaged you" from "someone wants to
+// be friends" without parsing text.
+function formatMessage(m) {
+  switch (m.kind) {
+    case "friend_request":
+      return `[friend request] @${m.from} wants to connect — sup requests, then sup accept @${m.from}`;
+    case "friend_accepted":
+      return `[friend accepted] @${m.from} — you can message each other now`;
+    default:
+      return `@${m.from}: ${m.text}`;
+  }
+}
+
 function printMessages(messages) {
   if (!messages || messages.length === 0) {
     out("(nothing new)");
     return;
   }
-  const lines = messages.map((m) => `@${m.from}: ${m.text}`);
-  out(lines.join("\n"));
+  out(messages.map(formatMessage).join("\n"));
 }
 
 async function cmdInbox(flags) {
@@ -501,7 +537,7 @@ async function cmdWatch(flags) {
       } else {
         const stamp = new Date().toISOString().slice(11, 19);
         for (const m of msgs) {
-          process.stdout.write(`[${stamp}] @${m.from}: ${m.text}\n`);
+          process.stdout.write(`[${stamp}] ${formatMessage(m)}\n`);
         }
       }
     }
@@ -526,6 +562,8 @@ Identity:
 
 Messaging:
   sup send @peer "message"            message a friend
+  sup queue @peer "message"           message anyone: sends now if friends,
+                                      else requests + holds until they accept
   sup inbox [--wait N] [--from @x]    read unread (auto-clears)
   sup wait --from @peer [--timeout N] block until a reply arrives
   sup history [--with @peer]          recent chat (last 24h)
@@ -590,6 +628,8 @@ async function main() {
       return cmdWhoami();
     case "send":
       return cmdSend(flags, positional);
+    case "queue":
+      return cmdQueue(flags, positional);
     case "inbox":
       return cmdInbox(flags);
     case "wait":

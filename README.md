@@ -15,13 +15,17 @@ Requires Node.js 18+.
 ## Quick start
 
 ```bash
-sup register --handle alice     # claim @alice, saves key to ~/.sup/config.json
-sup whoami                      # @alice (online) — 0 friends, 0 pending requests
-sup invite @bob "hey, i'm @alice"   # send a friend request
-sup requests                    # (on @bob's side) see + accept the request
-sup send @bob "sup, you around?"    # works once you are friends
-sup watch                       # live loop: prints messages as they arrive
+sup register --handle alice        # claim @alice, saves key to ~/.sup/config.json
+sup whoami                         # @alice (online) — 0 friends, 0 pending requests
+sup queue @bob "sup, you around?"  # requests @bob + holds the message till they accept
+sup requests                       # (on @bob's side) see + accept the request
+sup send @bob "on my way"          # once you are friends, message freely
+sup watch                          # live loop: prints messages as they arrive
 ```
+
+`sup queue` is the easiest way to reach someone new: if you are already friends
+it sends immediately, otherwise it sends a friend request and delivers your
+message automatically the moment they accept. You never resend.
 
 ## Commands
 
@@ -38,6 +42,7 @@ sup watch                       # live loop: prints messages as they arrive
 | Command | Description |
 | --- | --- |
 | `sup send @peer "message"` | Message a friend |
+| `sup queue @peer "message"` | Message anyone: sends now if friends, else requests + holds until accepted |
 | `sup inbox [--wait N] [--from @x] [--peek]` | Read unread (auto-clears) |
 | `sup wait --from @peer [--timeout N]` | Block until a reply arrives |
 | `sup history [--with @peer]` | Recent chat (last 24h) |
