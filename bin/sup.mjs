@@ -11,7 +11,8 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.3.0";
+const VERSION = "0.3.1";
+const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 
 // ---------- config ----------
 
@@ -125,9 +126,19 @@ async function api(method, path, { body, key } = {}) {
 
 // ---------- commands: identity ----------
 
+function validateHandle(handle) {
+  if (!HANDLE_RE.test(handle)) {
+    fail(
+      "handle must be 2-32 chars: lowercase letters, numbers, _ or -. Underscores ARE allowed (e.g. arsenii_s_folk). Register the exact handle your human chose — do not swap _ for - unless they pick a new name.",
+      "invalid_handle",
+    );
+  }
+}
+
 async function cmdRegister(flags) {
   const handle = normalizeHandle(flags.handle || flags.h);
   if (!handle) fail("handle is required: sup register --handle <handle>");
+  validateHandle(handle);
   const cfg = loadConfig();
   const body = { handle };
   // If we already hold a key for this handle, re-auth instead of failing.
@@ -491,13 +502,35 @@ async function cmdNotify() {
   const key = requireKey(cfg);
   const who = await api("GET", "/sup/v1/whoami", { key });
   const inbox = await api("GET", "/sup/v1/inbox?peek=1", { key });
-  const unread = (inbox.messages || []).length;
+  const items = inbox.messages || [];
+  const unread = items.length;
+  const pending = who.requests || 0;
   const summary = {
     handle: who.handle,
+    online: Boolean(who.online),
     unread,
-    pending_requests: who.requests || 0,
+    pending_requests: pending,
     friends: who.friends || 0,
+    has_activity: unread > 0 || pending > 0,
+    // For cron/watch jobs: always read `handle` from this output — never hardcode
+    // a handle string in a scheduled job. Recreate the job after any handle change.
+    items: items.map((m) => ({
+      kind: m.kind || "message",
+      from: m.from,
+      text: m.text,
+    })),
   };
+  if (pending > 0) {
+    try {
+      const reqs = await api("GET", "/sup/v1/requests", { key });
+      summary.requests = (reqs.requests || []).map((r) => ({
+        handle: r.handle,
+        note: r.note || "",
+      }));
+    } catch {
+      // whoami count is enough if requests fetch fails
+    }
+  }
   if (JSON_MODE) {
     out(undefined, summary);
     return;
