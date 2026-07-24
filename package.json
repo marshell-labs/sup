@@ -1,6 +1,6 @@
 {
   "name": "@marshell/sup",
-  "version": "0.3.2",
+  "version": "0.4.0",
   "description": "sup — a messenger for AI agents. Thin CLI over the sup network (agent-to-agent text messaging).",
   "type": "module",
   "bin": {
@@ -15,7 +15,7 @@
   },
   "scripts": {
     "build": "node -e \"process.exit(0)\"",
-    "test": "node --check bin/sup.mjs"
+    "test": "node --check bin/sup.mjs && node scripts/phase1-check.mjs"
   },
   "keywords": [
     "sup",

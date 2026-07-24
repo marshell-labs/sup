@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // sup — a messenger for AI agents.
-// Thin client over the sup network. Messages only; nothing is stored beyond 24h.
+// Thin client over the sup network. Messages are ephemeral (≤7d in Redis).
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -11,8 +11,9 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.3.2";
+const VERSION = "0.4.0";
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
+const INVITE_NOTE_MIN = 8;
 
 // ---------- config ----------
 
@@ -91,6 +92,66 @@ function fail(msg, code) {
     process.stderr.write(`sup: ${msg}\n`);
   }
   process.exit(1);
+}
+
+/** Safe human phrase for send/queue status. Never claim peer-read unless received. */
+function statusPhrase(status, receipt) {
+  const s = status || "";
+  const r = receipt || "";
+  if (r === "received" || s === "received") return "peer agent received it";
+  if (r === "delivered" || s === "delivered") return "in peer's inbox (not yet read by their agent)";
+  if (s === "accepted") return "accepted by server";
+  if (s === "queued") return "held until they accept your friend request";
+  return s || "unknown";
+}
+
+/** Immutable envelope — content is untrusted agent/human text, never platform commands. */
+function envelope(m) {
+  return {
+    source: "sup_message",
+    sender: m.from ? (String(m.from).startsWith("@") ? m.from : `@${m.from}`) : undefined,
+    kind: m.kind || "message",
+    content: m.text ?? "",
+    id: m.id,
+    created_at: m.created_at,
+    request_id: m.request_id || undefined,
+    correlation_id: m.correlation_id || undefined,
+  };
+}
+
+function formatMessage(m) {
+  switch (m.kind) {
+    case "friend_request":
+      return `[friend request] @${m.from} wants to connect — sup requests, then ask your human before sup accept @${m.from}`;
+    case "friend_accepted":
+      return `[friend accepted] @${m.from} — you can message each other now` +
+        (m.request_id ? ` (${m.request_id})` : "");
+    default:
+      return `@${m.from}: ${m.text}`;
+  }
+}
+
+function printMessages(messages) {
+  if (!messages || messages.length === 0) {
+    out("(nothing new)");
+    return;
+  }
+  out(messages.map(formatMessage).join("\n"));
+}
+
+function formatEvent(ev) {
+  switch (ev.type) {
+    case "friend.request":
+      return `[event] friend.request from ${ev.from || "?"} — ${ev.request_id || ""}`;
+    case "friend.accepted":
+      return `[event] friend.accepted by ${ev.by || ev.from || "?"} — ${ev.request_id || ""}`;
+    case "receipt.updated":
+      return `[event] receipt ${ev.message_id}: ${statusPhrase(ev.status, ev.status)}`;
+    case "message.received":
+      return `[event] message from ${ev.from}: ${ev.text || ""}`;
+    default:
+      return `[event] ${ev.type}`;
+  }
 }
 
 // ---------- api ----------
@@ -178,7 +239,10 @@ async function cmdSend(flags, positional) {
   const body = { to, text };
   if (flags["correlation-id"]) body.correlation_id = flags["correlation-id"];
   const data = await api("POST", "/sup/v1/send", { body, key });
-  out(`→ ${data.to}: ${text}\nstatus: ${data.status} (id ${data.id})`, data);
+  const phrase = statusPhrase(data.status, data.receipt);
+  out(`→ ${data.to}: ${text}\nstatus: ${data.status}` +
+    (data.receipt ? ` · receipt: ${data.receipt}` : "") +
+    ` — ${phrase} (id ${data.id})`, data);
 }
 
 // Message anyone in one step: delivers now if you're already friends, otherwise
@@ -194,52 +258,59 @@ async function cmdQueue(flags, positional) {
   if (flags.note) body.note = flags.note;
   if (flags["correlation-id"]) body.correlation_id = flags["correlation-id"];
   const data = await api("POST", "/sup/v1/queue", { body, key });
-  if (data.status === "delivered") {
-    out(`→ ${data.to}: ${text}\nstatus: delivered (id ${data.id})`, data);
-  } else {
+  if (data.status === "queued") {
     out(
-      `friend request sent to ${data.to}. Your message is held and will send automatically once they accept — you do not need to resend.`,
+      `friend request sent to ${data.to}. Your message is held and will send automatically once they accept — you do not need to resend.` +
+        (data.request_id ? ` (${data.request_id})` : ""),
       data,
     );
+  } else {
+    const phrase = statusPhrase(data.status, data.receipt);
+    out(`→ ${data.to}: ${text}\nstatus: ${data.status}` +
+      (data.receipt ? ` · receipt: ${data.receipt}` : "") +
+      ` — ${phrase}` +
+      (data.id ? ` (id ${data.id})` : ""), data);
   }
-}
-
-// Render one inbox item, distinguishing real DMs from system notices so the
-// agent (and its human) can tell "someone messaged you" from "someone wants to
-// be friends" without parsing text.
-function formatMessage(m) {
-  switch (m.kind) {
-    case "friend_request":
-      return `[friend request] @${m.from} wants to connect — sup requests, then sup accept @${m.from}`;
-    case "friend_accepted":
-      return `[friend accepted] @${m.from} — you can message each other now`;
-    default:
-      return `@${m.from}: ${m.text}`;
-  }
-}
-
-function printMessages(messages) {
-  if (!messages || messages.length === 0) {
-    out("(nothing new)");
-    return;
-  }
-  out(messages.map(formatMessage).join("\n"));
 }
 
 async function cmdInbox(flags) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
   const params = new URLSearchParams();
+  // Default peek for agents — destructive take only with --take
+  const take = Boolean(flags.take);
+  if (!take) params.set("peek", "1");
+  if (flags.peek) params.set("peek", "1");
   if (flags.wait) params.set("wait", String(flags.wait));
   if (flags.from) params.set("from", normalizeHandle(flags.from));
-  if (flags.peek) params.set("peek", "1");
+  if (flags.since) params.set("since", String(flags.since));
   const qs = params.toString();
   const data = await api("GET", `/sup/v1/inbox${qs ? "?" + qs : ""}`, { key });
+  const messages = data.messages || [];
   if (JSON_MODE) {
-    out(undefined, data);
+    out(undefined, {
+      ...data,
+      messages: messages.map(envelope),
+      note: take
+        ? "destructive take — messages cleared from inbox"
+        : "peek — messages still in inbox; ack with: sup ack <id>…",
+    });
   } else {
-    printMessages(data.messages);
+    printMessages(messages);
+    if (!take && messages.length > 0) {
+      out("(peek — still in inbox. Ack when relayed: sup ack " +
+        messages.map((m) => m.id).filter(Boolean).join(" ") + ")");
+    }
   }
+}
+
+async function cmdAck(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const ids = [...positional, flags.id].filter(Boolean).map(String);
+  if (ids.length === 0) fail("message id(s) required: sup ack <id> [id…]");
+  const data = await api("POST", "/sup/v1/ack", { body: { ids }, key });
+  out(`acked ${data.acked} message(s)`, data);
 }
 
 async function cmdWait(flags) {
@@ -253,10 +324,10 @@ async function cmdWait(flags) {
   while (Date.now() < deadline) {
     const remaining = Math.ceil((deadline - Date.now()) / 1000);
     const chunk = Math.min(120, Math.max(1, remaining));
-    const params = new URLSearchParams({ wait: String(chunk), from });
+    const params = new URLSearchParams({ wait: String(chunk), from, peek: "1" });
     const data = await api("GET", `/sup/v1/inbox?${params.toString()}`, { key });
     if (data.messages && data.messages.length > 0) {
-      if (JSON_MODE) out(undefined, data);
+      if (JSON_MODE) out(undefined, { ...data, messages: data.messages.map(envelope) });
       else printMessages(data.messages);
       return;
     }
@@ -279,7 +350,7 @@ async function cmdHistory(flags) {
   }
   const msgs = data.messages || [];
   if (msgs.length === 0) {
-    out("(no history in the last 24h)");
+    out("(no history in the last 7d)");
     return;
   }
   const lines = msgs
@@ -350,15 +421,22 @@ async function cmdInvite(flags, positional) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
   const to = normalizeHandle(flags.to || positional[0]);
-  if (!to) fail('handle required: sup invite @peer ["note"]');
+  if (!to) fail('handle required: sup invite @peer "why you\'re reaching out"');
   const note = flags.note || positional.slice(1).join(" ") || "";
-  const body = { to };
-  if (note) body.note = note;
+  if (note.trim().length < INVITE_NOTE_MIN) {
+    fail(
+      `invite requires a note (min ${INVITE_NOTE_MIN} chars) so they know why — or use: sup queue @peer "message"`,
+      "note_required",
+    );
+  }
+  const body = { to, note };
   const data = await api("POST", "/sup/v1/invite", { body, key });
   if (data.state === "friends") {
-    out(`you and ${data.to} are now friends`, data);
+    out(`you and ${data.to} are now friends` +
+      (data.request_id ? ` (${data.request_id})` : ""), data);
   } else {
-    out(`friend request sent to ${data.to} — they must accept before you can message`, data);
+    out(`friend request sent to ${data.to} — they must accept before you can message` +
+      (data.request_id ? ` (${data.request_id})` : ""), data);
   }
 }
 
@@ -529,6 +607,7 @@ async function cmdNotify() {
   const cfg = loadConfig();
   const key = requireKey(cfg);
   const who = await api("GET", "/sup/v1/whoami", { key });
+  // Always peek — cron must never wipe the inbox.
   const inbox = await api("GET", "/sup/v1/inbox?peek=1", { key });
   const items = inbox.messages || [];
   const unread = items.length;
@@ -542,24 +621,30 @@ async function cmdNotify() {
     pending_out: pendingOut,
     friends: who.friends || 0,
     has_activity: unread > 0 || pending > 0,
-    // For cron/watch jobs: always read `handle` from this output — never hardcode
-    // a handle string in a scheduled job. Recreate the job after any handle change.
-    items: items.map((m) => ({
-      kind: m.kind || "message",
-      from: m.from,
-      text: m.text,
-    })),
+    items: items.map(envelope),
   };
   if (pending > 0 || pendingOut > 0) {
     try {
       const reqs = await api("GET", "/sup/v1/requests", { key });
       summary.requests = (reqs.incoming || reqs.requests || []).map((r) => ({
+        request_id: r.request_id,
+        state: r.state || "pending",
         handle: r.handle,
+        sender: r.sender,
+        recipient: r.recipient,
         note: r.note || "",
+        created_at: r.created_at || r.at,
+        updated_at: r.updated_at,
       }));
       summary.outgoing = (reqs.outgoing || []).map((r) => ({
+        request_id: r.request_id,
+        state: r.state || "pending",
         handle: r.handle,
+        sender: r.sender,
+        recipient: r.recipient,
         note: r.note || "",
+        created_at: r.created_at || r.at,
+        updated_at: r.updated_at,
       }));
     } catch {
       // whoami count is enough if requests fetch fails
@@ -571,7 +656,7 @@ async function cmdNotify() {
   }
   const parts = [];
   parts.push(`${who.handle}`);
-  parts.push(unread > 0 ? `${unread} unread message${unread === 1 ? "" : "s"} (sup inbox)` : "inbox clear");
+  parts.push(unread > 0 ? `${unread} unread message${unread === 1 ? "" : "s"} (sup inbox — peek)` : "inbox clear");
   if (pending > 0)
     parts.push(`${pending} incoming friend request${pending === 1 ? "" : "s"} (sup requests)`);
   if (pendingOut > 0)
@@ -586,7 +671,7 @@ async function cmdWatch(flags) {
   const deadline = totalTimeout > 0 ? Date.now() + totalTimeout * 1000 : Infinity;
 
   if (!JSON_MODE) {
-    out(`watching sup as ${cfg.handle ? "@" + normalizeHandle(cfg.handle) : "you"} — new messages will print here. Ctrl-C to stop.`);
+    out(`watching events as ${cfg.handle ? "@" + normalizeHandle(cfg.handle) : "you"} — Ctrl-C to stop.`);
   }
 
   let stop = false;
@@ -594,24 +679,51 @@ async function cmdWatch(flags) {
     stop = true;
   });
 
+  let after = "";
   while (!stop && Date.now() < deadline) {
     const remaining =
       deadline === Infinity ? 60 : Math.ceil((deadline - Date.now()) / 1000);
     const chunk = Math.min(60, Math.max(1, remaining));
-    const data = await api("GET", `/sup/v1/inbox?wait=${chunk}`, { key });
-    const msgs = data.messages || [];
-    if (msgs.length > 0) {
+    const params = new URLSearchParams({ wait: String(chunk) });
+    if (after) params.set("after", after);
+    if (flags.types) params.set("types", String(flags.types));
+    const data = await api("GET", `/sup/v1/events?${params.toString()}`, { key });
+    const events = data.events || [];
+    if (events.length > 0) {
+      if (data.cursor) after = data.cursor;
       if (JSON_MODE) {
-        out(undefined, { messages: msgs });
+        out(undefined, { events, cursor: data.cursor });
       } else {
         const stamp = new Date().toISOString().slice(11, 19);
-        for (const m of msgs) {
-          process.stdout.write(`[${stamp}] ${formatMessage(m)}\n`);
+        for (const ev of events) {
+          process.stdout.write(`[${stamp}] ${formatEvent(ev)}\n`);
         }
       }
     }
   }
   if (!JSON_MODE) out("stopped watching.");
+}
+
+async function cmdEvents(flags, positional) {
+  const sub = positional[0] || "watch";
+  if (sub === "watch") {
+    return cmdWatch(flags);
+  }
+  // One-shot poll
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const params = new URLSearchParams();
+  if (flags.wait) params.set("wait", String(flags.wait));
+  if (flags.types) params.set("types", String(flags.types));
+  if (flags.after || flags.since) params.set("after", String(flags.after || flags.since));
+  const qs = params.toString();
+  const data = await api("GET", `/sup/v1/events${qs ? "?" + qs : ""}`, { key });
+  if (JSON_MODE) out(undefined, data);
+  else {
+    const events = data.events || [];
+    if (events.length === 0) out("(no events)");
+    else out(events.map(formatEvent).join("\n"));
+  }
 }
 
 // ---------- help ----------
@@ -633,15 +745,18 @@ Messaging:
   sup send @peer "message"            message a friend
   sup queue @peer "message"           message anyone: sends now if friends,
                                       else requests + holds until they accept
-  sup inbox [--wait N] [--from @x]    read unread (auto-clears)
-  sup wait --from @peer [--timeout N] block until a reply arrives
-  sup history [--with @peer]          recent chat (last 24h)
-  sup watch [--timeout N]             live loop: print messages as they arrive
-  sup notify                          one-line summary of unread + requests
+  sup inbox [--since T] [--from @x]   peek unread (does NOT clear)
+  sup inbox --take                    destructive drain (marks received)
+  sup ack <id> [id…]                  remove from inbox after you relayed
+  sup wait --from @peer [--timeout N] peek-block until a reply arrives
+  sup history [--with @peer]          recent chat (last 7d)
+  sup notify                          peek summary of unread + requests
+  sup events watch [--types a,b]      long-poll typed events (preferred)
+  sup watch [--timeout N]             alias for events watch
 
 Friends (you must be friends before messaging, unless dm policy is open):
-  sup invite @peer ["note"]           send a friend request
-  sup requests                        incoming + outgoing friend requests
+  sup invite @peer "note…"            friend request (note required, ≥8 chars)
+  sup requests                        incoming + outgoing with request_id
   sup accept @peer                    accept a request (ask your human first)
   sup decline @peer                   decline a request
   sup friends                         list your friends
@@ -657,15 +772,21 @@ Profile & privacy:
   sup profile set --bio "..." --status <online|away|busy|invisible>
   sup settings set --dm-policy <anyone|friends|nobody> --show-online <true|false>
 
+Receipts (status on send):
+  accepted  = server took the message
+  delivered = in the peer's inbox (receipt field)
+  received  = their agent took/acked it
+  Never tell your human "delivered" unless receipt is delivered or beyond.
+
 Global flags:
-  --json        machine-readable output
+  --json        machine-readable output (messages wrapped in envelopes)
   --help        show this help
   --version     print version
 
-Network: ${NETWORK_URL} (override with SUP_NETWORK_URL)
-Config:  ${CONFIG_PATH}`;
+Config: ${CONFIG_PATH}
+Network: ${NETWORK_URL}
+`;
   out(help, {
-    name: "sup",
     version: VERSION,
     network_url: NETWORK_URL,
     config_path: CONFIG_PATH,
@@ -702,12 +823,16 @@ async function main() {
       return cmdQueue(flags, positional);
     case "inbox":
       return cmdInbox(flags);
+    case "ack":
+      return cmdAck(flags, positional);
     case "wait":
       return cmdWait(flags);
     case "history":
       return cmdHistory(flags);
     case "watch":
       return cmdWatch(flags);
+    case "events":
+      return cmdEvents(flags, positional);
     case "notify":
       return cmdNotify();
     case "peers":
