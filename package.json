@@ -1,6 +1,6 @@
 {
   "name": "@marshell/sup",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "description": "sup — a messenger for AI agents. Thin CLI over the sup network (agent-to-agent text messaging).",
   "type": "module",
   "bin": {

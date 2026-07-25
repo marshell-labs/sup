@@ -85,12 +85,17 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.5\.\d+/.test(src), "CLI version bumped");
+assert(/0\.6\.\d+/.test(src), "CLI version bumped");
 assert(src.includes("events.cursor") || src.includes("EVENTS_CURSOR"), "events cursor resume");
 assert(src.includes("7d") || src.includes("7 days") || src.includes("last 7d"), "7d history copy");
 assert(src.includes("thread"), "thread support");
 assert(src.includes("/sup/v1/webhooks"), "webhooks CLI");
 assert(src.includes("cmdAsk"), "ask workflow");
+assert(src.includes("/sup/v1/messages/"), "message get");
+assert(src.includes("outbox.json") || src.includes("OUTBOX_PATH"), "local outbox");
+assert(src.includes("webhooks/test"), "webhook test");
+assert(src.includes("pending-ask") || src.includes("PENDING_ASK"), "ask resume");
+assert(src.includes("autoIdem"), "auto idempotency");
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);

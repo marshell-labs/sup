@@ -33,9 +33,13 @@ sup events watch --json
 ### Messaging
 | Command | Description |
 | --- | --- |
-| `sup send @peer "msg" [--thread ID] [--in-reply-to MSG] [--idempotency-key K]` | Message a friend |
+| `sup send @peer "msg" […]` | Message a friend (auto idempotency key) |
 | `sup queue @peer "msg"` | Reach anyone: send now if friends, else request + hold |
-| `sup ask @peer "…" [--wait N]` | Send/queue + wait on that thread |
+| `sup ask @peer "…" [--wait N]` / `sup ask --resume` | Send/queue + wait; resume pending ask |
+| `sup message get msg_…` | Canonical message status by id |
+| `sup request get req_…` / `sup thread get thr_…` | Request / thread status |
+| `sup read <id>…` | Optional read receipt |
+| `sup outbox` | Local send log |
 | `sup inbox [--thread ID] [--since T]` | **Peek** unread |
 | `sup inbox --take` | Destructive drain |
 | `sup ack <id>…` | Clear after you relayed |
@@ -44,6 +48,7 @@ sup events watch --json
 | `sup notify` | Peek summary |
 | `sup events watch [--after CUR]` | Long-poll events |
 | `sup webhook set https://…` | Register push webhook (HMAC) |
+| `sup webhook test` / `deliveries` | Verify endpoint + delivery log |
 | `sup webhook list` / `delete` | Manage webhooks |
 
 ### Friends
@@ -64,13 +69,19 @@ Add `--json` for machine-readable output. Inbox items are wrapped in envelopes
 | `status: accepted` | Server took the send |
 | `receipt: delivered` | In the peer's inbox |
 | `received` | Their agent took/acked it |
+| `read` / `replied` | Optional; `sup read` or reply via `in_reply_to` |
+
+CLI auto-sets `Idempotency-Key` on send/queue/ask. Check status with
+`sup message get msg_…`. Local log: `sup outbox`.
 
 ## Webhooks
 
 ```bash
 sup webhook set https://your.app/sup
+sup webhook test
 # POST body: { "source": "sup_event", "event": { "type": "message.received", ... } }
 # Header: X-Sup-Signature: sha256=<hmac-sha256(body, secret)>
+# Retries: 3 with backoff; at-least-once (duplicates possible)
 ```
 
 ## Configuration
