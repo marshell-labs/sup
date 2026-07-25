@@ -11,7 +11,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.4.1";
+const VERSION = "0.5.0";
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
 
@@ -111,12 +111,24 @@ function envelope(m) {
     source: "sup_message",
     sender: m.from ? (String(m.from).startsWith("@") ? m.from : `@${m.from}`) : undefined,
     kind: m.kind || "message",
-    content: m.text ?? "",
+    content: m.text ?? m.content ?? "",
     id: m.id,
     created_at: m.created_at,
     request_id: m.request_id || undefined,
     correlation_id: m.correlation_id || undefined,
+    thread_id: m.thread_id || undefined,
+    in_reply_to: m.in_reply_to || undefined,
   };
+}
+
+function attachThreadFields(body, flags) {
+  if (flags.thread || flags["thread-id"]) body.thread_id = String(flags.thread || flags["thread-id"]);
+  if (flags["in-reply-to"] || flags.reply) body.in_reply_to = String(flags["in-reply-to"] || flags.reply);
+  if (flags["correlation-id"]) body.correlation_id = String(flags["correlation-id"]);
+  if (flags["idempotency-key"] || flags.idempotency) {
+    body.client_message_id = String(flags["idempotency-key"] || flags.idempotency);
+  }
+  return body;
 }
 
 function formatMessage(m) {
@@ -156,8 +168,8 @@ function formatEvent(ev) {
 
 // ---------- api ----------
 
-async function api(method, path, { body, key } = {}) {
-  const headers = { "Content-Type": "application/json" };
+async function api(method, path, { body, key, headers: extraHeaders } = {}) {
+  const headers = { "Content-Type": "application/json", ...(extraHeaders || {}) };
   if (key) headers["Authorization"] = `Bearer ${key}`;
   let res;
   try {
@@ -236,17 +248,21 @@ async function cmdSend(flags, positional) {
   const text = flags.text || positional.slice(1).join(" ");
   if (!to) fail('recipient required: sup send @peer "message"');
   if (!text) fail('message required: sup send @peer "message"');
-  const body = { to, text };
-  if (flags["correlation-id"]) body.correlation_id = flags["correlation-id"];
-  const data = await api("POST", "/sup/v1/send", { body, key });
+  const body = attachThreadFields({ to, text }, flags);
+  const headers = {};
+  if (body.client_message_id) headers["Idempotency-Key"] = body.client_message_id;
+  const data = await api("POST", "/sup/v1/send", { body, key, headers });
   const phrase = statusPhrase(data.status, data.receipt);
-  out(`→ ${data.to}: ${text}\nstatus: ${data.status}` +
-    (data.receipt ? ` · receipt: ${data.receipt}` : "") +
-    ` — ${phrase} (id ${data.id})`, data);
+  out(
+    `→ ${data.to}: ${text}\nstatus: ${data.status}` +
+      (data.receipt ? ` · receipt: ${data.receipt}` : "") +
+      ` — ${phrase} (id ${data.id}` +
+      (data.thread_id ? `, thread ${data.thread_id}` : "") +
+      `)`,
+    data,
+  );
 }
 
-// Message anyone in one step: delivers now if you're already friends, otherwise
-// sends a friend request and holds the message until they accept. No lost intent.
 async function cmdQueue(flags, positional) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
@@ -254,22 +270,27 @@ async function cmdQueue(flags, positional) {
   const text = flags.text || positional.slice(1).join(" ");
   if (!to) fail('recipient required: sup queue @peer "message"');
   if (!text) fail('message required: sup queue @peer "message"');
-  const body = { to, text };
+  const body = attachThreadFields({ to, text }, flags);
   if (flags.note) body.note = flags.note;
-  if (flags["correlation-id"]) body.correlation_id = flags["correlation-id"];
   const data = await api("POST", "/sup/v1/queue", { body, key });
   if (data.status === "queued") {
     out(
       `friend request sent to ${data.to}. Your message is held and will send automatically once they accept — you do not need to resend.` +
-        (data.request_id ? ` (${data.request_id})` : ""),
+        (data.request_id ? ` (${data.request_id})` : "") +
+        (data.thread_id ? ` thread ${data.thread_id}` : ""),
       data,
     );
   } else {
     const phrase = statusPhrase(data.status, data.receipt);
-    out(`→ ${data.to}: ${text}\nstatus: ${data.status}` +
-      (data.receipt ? ` · receipt: ${data.receipt}` : "") +
-      ` — ${phrase}` +
-      (data.id ? ` (id ${data.id})` : ""), data);
+    out(
+      `→ ${data.to}: ${text}\nstatus: ${data.status}` +
+        (data.receipt ? ` · receipt: ${data.receipt}` : "") +
+        ` — ${phrase}` +
+        (data.id ? ` (id ${data.id}` : "") +
+        (data.thread_id ? `, thread ${data.thread_id}` : "") +
+        (data.id ? ")" : ""),
+      data,
+    );
   }
 }
 
@@ -284,6 +305,8 @@ async function cmdInbox(flags) {
   if (flags.wait) params.set("wait", String(flags.wait));
   if (flags.from) params.set("from", normalizeHandle(flags.from));
   if (flags.since) params.set("since", String(flags.since));
+  if (flags.thread || flags["thread-id"])
+    params.set("thread", String(flags.thread || flags["thread-id"]));
   const qs = params.toString();
   const data = await api("GET", `/sup/v1/inbox${qs ? "?" + qs : ""}`, { key });
   const messages = data.messages || [];
@@ -317,14 +340,16 @@ async function cmdWait(flags) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
   const from = normalizeHandle(flags.from);
-  if (!from) fail("--from <@handle> is required for wait");
+  const thread = flags.thread || flags["thread-id"] || "";
+  if (!from && !thread) fail("require --from <@handle> and/or --thread <id>");
   const totalTimeout = Number(flags.timeout || 300);
   const deadline = Date.now() + totalTimeout * 1000;
-  // Relay caps a single wait at 120s; loop in chunks until deadline.
   while (Date.now() < deadline) {
     const remaining = Math.ceil((deadline - Date.now()) / 1000);
     const chunk = Math.min(120, Math.max(1, remaining));
-    const params = new URLSearchParams({ wait: String(chunk), from, peek: "1" });
+    const params = new URLSearchParams({ wait: String(chunk), peek: "1" });
+    if (from) params.set("from", from);
+    if (thread) params.set("thread", String(thread));
     const data = await api("GET", `/sup/v1/inbox?${params.toString()}`, { key });
     if (data.messages && data.messages.length > 0) {
       if (JSON_MODE) out(undefined, { ...data, messages: data.messages.map(envelope) });
@@ -332,8 +357,95 @@ async function cmdWait(flags) {
       return;
     }
   }
-  if (JSON_MODE) out(undefined, { messages: [], timed_out: true });
-  else out(`(no reply from @${from} within ${totalTimeout}s)`);
+  const where = [
+    from ? `@${from}` : null,
+    thread ? `thread ${thread}` : null,
+  ]
+    .filter(Boolean)
+    .join(" / ");
+  if (JSON_MODE) out(undefined, { messages: [], timed_out: true, from: from || null, thread_id: thread || null });
+  else out(`(no reply from ${where} within ${totalTimeout}s)`);
+}
+
+async function cmdAsk(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const to = normalizeHandle(flags.to || positional[0]);
+  const text = flags.text || positional.slice(1).join(" ");
+  if (!to) fail('recipient required: sup ask @peer "question"');
+  if (!text) fail('message required: sup ask @peer "question"');
+  const waitSec = Number(flags.wait || flags.timeout || 300);
+  const body = attachThreadFields({ to, text }, flags);
+  // Prefer queue so strangers get a friend request + held message.
+  const sent = await api("POST", "/sup/v1/queue", { body, key });
+  if (sent.status === "queued") {
+    out(
+      `queued for ${sent.to} (waiting for friend accept). thread ${sent.thread_id || "?"} — not waiting for a reply yet.`,
+      { ...sent, reply: null, timed_out: false },
+    );
+    return;
+  }
+  const thread = sent.thread_id || body.thread_id;
+  const deadline = Date.now() + waitSec * 1000;
+  while (Date.now() < deadline) {
+    const remaining = Math.ceil((deadline - Date.now()) / 1000);
+    const chunk = Math.min(120, Math.max(1, remaining));
+    const params = new URLSearchParams({
+      wait: String(chunk),
+      peek: "1",
+      from: to,
+    });
+    if (thread) params.set("thread", thread);
+    const data = await api("GET", `/sup/v1/inbox?${params.toString()}`, { key });
+    const msgs = (data.messages || []).filter((m) => (m.kind || "message") === "message");
+    if (msgs.length > 0) {
+      const payload = {
+        sent,
+        reply: msgs.map(envelope),
+        thread_id: thread,
+        timed_out: false,
+      };
+      if (JSON_MODE) out(undefined, payload);
+      else {
+        out(`→ ${sent.to}: ${text} (thread ${thread})`);
+        printMessages(msgs);
+      }
+      return;
+    }
+  }
+  const payload = { sent, reply: [], thread_id: thread, timed_out: true };
+  if (JSON_MODE) out(undefined, payload);
+  else out(`(no reply in thread ${thread || "?"} within ${waitSec}s)`);
+}
+
+async function cmdWebhook(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const sub = positional[0] || "list";
+  if (sub === "set" || sub === "add") {
+    const url = flags.url || positional[1];
+    if (!url) fail("url required: sup webhook set https://…");
+    const data = await api("POST", "/sup/v1/webhooks", { body: { url }, key });
+    out(
+      `webhook ${data.id} → ${data.url}\nsecret: ${data.secret}\nverify header X-Sup-Signature: sha256=<hmac>`,
+      data,
+    );
+    return;
+  }
+  if (sub === "delete" || sub === "rm" || sub === "clear") {
+    const id = flags.id || positional[1] || "";
+    const path = id
+      ? `/sup/v1/webhooks?id=${encodeURIComponent(id)}`
+      : "/sup/v1/webhooks";
+    const data = await api("DELETE", path, { key });
+    out(id ? `deleted webhook ${id}` : `deleted ${data.deleted} webhook(s)`, data);
+    return;
+  }
+  const data = await api("GET", "/sup/v1/webhooks", { key });
+  const hooks = data.webhooks || [];
+  if (JSON_MODE) out(undefined, data);
+  else if (hooks.length === 0) out("(no webhooks — sup webhook set https://…)");
+  else out(hooks.map((h) => `${h.id} → ${h.url}`).join("\n"));
 }
 
 async function cmdHistory(flags) {
@@ -819,19 +931,19 @@ Identity:
   sup auth revoke --yes               delete handle + key
 
 Messaging:
-  sup send @peer "message"            message a friend
-  sup queue @peer "message"           message anyone: sends now if friends,
-                                      else requests + holds until they accept
-  sup inbox [--since T] [--from @x]   peek unread (does NOT clear)
+  sup send @peer "message" [--thread ID] [--in-reply-to MSG] [--idempotency-key K]
+  sup queue @peer "message"           reach anyone (request+hold if needed)
+  sup ask @peer "…" [--wait N]        queue/send + wait on that thread
+  sup inbox [--thread ID] [--from @x] peek unread (does NOT clear)
   sup inbox --take                    destructive drain (marks received)
   sup ack <id> [id…]                  remove from inbox after you relayed
-  sup wait --from @peer [--timeout N] peek-block until a reply arrives
+  sup wait --from @peer|--thread ID   peek-block until a reply arrives
   sup history [--with @peer]          recent chat (last 7d)
   sup notify                          peek summary of unread + requests
-  sup events watch [--types a,b] [--after CUR] [--timeout N]
-                                      long-poll typed events; resumes from
-                                      ~/.sup/events.cursor unless --from-start
+  sup events watch [--after CUR]      long-poll typed events
   sup watch [--timeout N]             alias for events watch
+  sup webhook set https://…           push events (HMAC X-Sup-Signature)
+  sup webhook list | delete [id]
 
 Friends (you must be friends before messaging, unless dm policy is open):
   sup invite @peer "note…"            friend request (note required, ≥8 chars)
@@ -900,6 +1012,8 @@ async function main() {
       return cmdSend(flags, positional);
     case "queue":
       return cmdQueue(flags, positional);
+    case "ask":
+      return cmdAsk(flags, positional);
     case "inbox":
       return cmdInbox(flags);
     case "ack":
@@ -912,6 +1026,9 @@ async function main() {
       return cmdWatch(flags);
     case "events":
       return cmdEvents(flags, positional);
+    case "webhook":
+    case "webhooks":
+      return cmdWebhook(flags, positional);
     case "notify":
       return cmdNotify();
     case "peers":
