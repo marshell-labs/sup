@@ -85,7 +85,8 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(src.includes("0.4.0"), "CLI version bumped");
+assert(/0\.4\.\d+/.test(src), "CLI version bumped");
+assert(src.includes("events.cursor") || src.includes("EVENTS_CURSOR"), "events cursor resume");
 assert(src.includes("7d") || src.includes("7 days") || src.includes("last 7d"), "7d history copy");
 
 if (failed) {

@@ -11,7 +11,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.4.0";
+const VERSION = "0.4.1";
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
 
@@ -664,22 +664,55 @@ async function cmdNotify() {
   out(parts.join(" · "));
 }
 
+const EVENTS_CURSOR_PATH = join(CONFIG_DIR, "events.cursor");
+
+function loadEventsCursor() {
+  try {
+    return String(readFileSync(EVENTS_CURSOR_PATH, "utf8")).trim();
+  } catch {
+    return "";
+  }
+}
+
+function saveEventsCursor(cursor) {
+  if (!cursor) return;
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(EVENTS_CURSOR_PATH, cursor + "\n", { mode: 0o600 });
+  } catch {
+    // best-effort resume helper
+  }
+}
+
 async function cmdWatch(flags) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
   const totalTimeout = flags.timeout ? Number(flags.timeout) : 0; // 0 = forever
   const deadline = totalTimeout > 0 ? Date.now() + totalTimeout * 1000 : Infinity;
 
+  let after = "";
+  if (flags["from-start"] || flags.fromstart) {
+    after = "";
+  } else if (flags.after || flags.since) {
+    after = String(flags.after || flags.since);
+  } else {
+    after = loadEventsCursor();
+  }
+
   if (!JSON_MODE) {
-    out(`watching events as ${cfg.handle ? "@" + normalizeHandle(cfg.handle) : "you"} — Ctrl-C to stop.`);
+    out(
+      `watching events as ${cfg.handle ? "@" + normalizeHandle(cfg.handle) : "you"}` +
+        (after ? ` (resume after ${after})` : " (from tip)") +
+        " — Ctrl-C to stop.",
+    );
   }
 
   let stop = false;
+  let sawAny = false;
   process.on("SIGINT", () => {
     stop = true;
   });
 
-  let after = "";
   while (!stop && Date.now() < deadline) {
     const remaining =
       deadline === Infinity ? 60 : Math.ceil((deadline - Date.now()) / 1000);
@@ -690,9 +723,13 @@ async function cmdWatch(flags) {
     const data = await api("GET", `/sup/v1/events?${params.toString()}`, { key });
     const events = data.events || [];
     if (events.length > 0) {
-      if (data.cursor) after = data.cursor;
+      sawAny = true;
+      if (data.cursor) {
+        after = data.cursor;
+        saveEventsCursor(after);
+      }
       if (JSON_MODE) {
-        out(undefined, { events, cursor: data.cursor });
+        out(undefined, { events, cursor: data.cursor || after });
       } else {
         const stamp = new Date().toISOString().slice(11, 19);
         for (const ev of events) {
@@ -701,13 +738,34 @@ async function cmdWatch(flags) {
       }
     }
   }
-  if (!JSON_MODE) out("stopped watching.");
+  if (JSON_MODE) {
+    if (!sawAny) {
+      out(undefined, {
+        events: [],
+        cursor: after || null,
+        timed_out: totalTimeout > 0,
+        note: after
+          ? "no events after cursor — save/pass --after to resume"
+          : "no events during watch window",
+      });
+    }
+  } else if (!sawAny) {
+    out(
+      totalTimeout > 0
+        ? `(no events within ${totalTimeout}s` +
+            (after ? `; cursor ${after}` : "") +
+            " — idle, not an error)"
+        : "stopped watching.",
+    );
+  } else if (!JSON_MODE) {
+    out("stopped watching." + (after ? ` cursor: ${after}` : ""));
+  }
 }
 
 async function cmdEvents(flags, positional) {
   const sub = positional[0] || "watch";
   if (sub === "watch") {
-    return cmdWatch(flags);
+    return cmdWatch({ ...flags, ...(positional[1] ? {} : {}) });
   }
   // One-shot poll
   const cfg = loadConfig();
@@ -715,14 +773,33 @@ async function cmdEvents(flags, positional) {
   const params = new URLSearchParams();
   if (flags.wait) params.set("wait", String(flags.wait));
   if (flags.types) params.set("types", String(flags.types));
-  if (flags.after || flags.since) params.set("after", String(flags.after || flags.since));
+  let after = flags.after || flags.since;
+  if (!after && !flags["from-start"] && !flags.fromstart) {
+    after = loadEventsCursor();
+  }
+  if (after) params.set("after", String(after));
   const qs = params.toString();
   const data = await api("GET", `/sup/v1/events${qs ? "?" + qs : ""}`, { key });
-  if (JSON_MODE) out(undefined, data);
-  else {
+  if (data.cursor) saveEventsCursor(data.cursor);
+  if (JSON_MODE) {
+    out(undefined, {
+      ...data,
+      note:
+        (data.events || []).length === 0
+          ? "no events — idle/empty, not a failure; pass --after <cursor> to resume"
+          : undefined,
+    });
+  } else {
     const events = data.events || [];
-    if (events.length === 0) out("(no events)");
-    else out(events.map(formatEvent).join("\n"));
+    if (events.length === 0) {
+      out(
+        "(no events)" +
+          (data.cursor || after ? ` — cursor ${data.cursor || after}` : ""),
+      );
+    } else {
+      out(events.map(formatEvent).join("\n"));
+      if (data.cursor) out(`(cursor: ${data.cursor})`);
+    }
   }
 }
 
@@ -751,7 +828,9 @@ Messaging:
   sup wait --from @peer [--timeout N] peek-block until a reply arrives
   sup history [--with @peer]          recent chat (last 7d)
   sup notify                          peek summary of unread + requests
-  sup events watch [--types a,b]      long-poll typed events (preferred)
+  sup events watch [--types a,b] [--after CUR] [--timeout N]
+                                      long-poll typed events; resumes from
+                                      ~/.sup/events.cursor unless --from-start
   sup watch [--timeout N]             alias for events watch
 
 Friends (you must be friends before messaging, unless dm policy is open):
