@@ -11,7 +11,8 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.8.0";
+const VERSION = "0.8.1";
+const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
 const OUTBOX_PATH = join(CONFIG_DIR, "outbox.json");
@@ -261,18 +262,37 @@ function formatEvent(ev) {
 
 // ---------- api ----------
 
-async function api(method, path, { body, key, headers: extraHeaders } = {}) {
+async function api(
+  method,
+  path,
+  { body, key, headers: extraHeaders, timeoutMs, softTimeout } = {},
+) {
   const headers = { "Content-Type": "application/json", ...(extraHeaders || {}) };
   if (key) headers["Authorization"] = `Bearer ${key}`;
+  const ctrl = timeoutMs ? new AbortController() : null;
+  const timer = ctrl
+    ? setTimeout(() => ctrl.abort(), timeoutMs)
+    : null;
   let res;
   try {
     res = await fetch(`${NETWORK_URL}${path}`, {
       method,
       headers,
       body: body ? JSON.stringify(body) : undefined,
+      signal: ctrl?.signal,
     });
   } catch (e) {
+    if (e?.name === "AbortError") {
+      if (softTimeout) {
+        const err = new Error(`request timed out after ${timeoutMs}ms`);
+        err.code = "timeout";
+        throw err;
+      }
+      fail(`request timed out after ${timeoutMs}ms`, "timeout");
+    }
     fail(`network error: ${e.message}`, "network_error");
+  } finally {
+    if (timer) clearTimeout(timer);
   }
   const text = await res.text();
   let data = {};
@@ -491,53 +511,153 @@ async function cmdWait(flags) {
   else out(`(no reply from ${where} within ${totalTimeout}s)`);
 }
 
+/** Poll inbox until a DM arrives or waitSec elapses. Never hangs past deadline. */
 async function waitThreadReply(key, to, thread, waitSec) {
-  const deadline = Date.now() + waitSec * 1000;
+  const started = Date.now();
+  const deadline = started + waitSec * 1000;
+  const timeoutAt = new Date(deadline).toISOString();
+  let lastCheckedAt = null;
   while (Date.now() < deadline) {
-    const remaining = Math.ceil((deadline - Date.now()) / 1000);
-    const chunk = Math.min(120, Math.max(1, remaining));
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) break;
+    // Cap chunk at 30s so we re-check the deadline often; +15s abort cushion.
+    const chunk = Math.min(30, Math.max(1, Math.ceil(remainingMs / 1000)));
     const params = new URLSearchParams({
       wait: String(chunk),
       peek: "1",
       from: to,
     });
     if (thread) params.set("thread", thread);
-    const data = await api("GET", `/sup/v1/inbox?${params.toString()}`, { key });
-    const msgs = (data.messages || []).filter((m) => isDMKind(m.kind));
-    if (msgs.length > 0) return msgs;
+    try {
+      const data = await api("GET", `/sup/v1/inbox?${params.toString()}`, {
+        key,
+        timeoutMs: (chunk + 15) * 1000,
+        softTimeout: true,
+      });
+      lastCheckedAt = new Date().toISOString();
+      const msgs = (data.messages || []).filter((m) => isDMKind(m.kind));
+      if (msgs.length > 0) {
+        return {
+          msgs,
+          timed_out: false,
+          last_checked_at: lastCheckedAt,
+          timeout_at: timeoutAt,
+          waited_ms: Date.now() - started,
+        };
+      }
+    } catch (e) {
+      // Stalled poll — count as a check and continue until overall deadline.
+      lastCheckedAt = new Date().toISOString();
+      if (e?.code !== "timeout") throw e;
+    }
   }
-  return [];
+  return {
+    msgs: [],
+    timed_out: true,
+    last_checked_at: lastCheckedAt || new Date().toISOString(),
+    timeout_at: timeoutAt,
+    waited_ms: Date.now() - started,
+  };
+}
+
+function askPendingPayload(pending, extra = {}) {
+  return {
+    state: "pending",
+    to: pending.to ? `@${normalizeHandle(pending.to)}` : null,
+    thread_id: pending.thread_id || null,
+    message_id: pending.message_id || null,
+    request_id: pending.request_id || null,
+    client_message_id: pending.client_message_id || null,
+    text: pending.text || null,
+    at: pending.at || null,
+    resume: `sup ask --resume --wait ${ASK_DEFAULT_WAIT_SEC} --json`,
+    ...extra,
+  };
 }
 
 async function cmdAsk(flags, positional) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
-  const waitSec = Number(flags.wait || flags.timeout || 300);
+  const waitSec = Number(flags.wait || flags.timeout || ASK_DEFAULT_WAIT_SEC);
+  if (!Number.isFinite(waitSec) || waitSec <= 0) {
+    fail("--wait must be a positive number of seconds", "invalid_wait");
+  }
+
+  if (flags.status || positional[0] === "status") {
+    const pending = loadPendingAsk();
+    if (!pending?.thread_id) {
+      const empty = { state: "idle", pending: null, resume: null };
+      if (JSON_MODE) out(undefined, empty);
+      else out("(no pending ask)");
+      return;
+    }
+    const payload = askPendingPayload(pending);
+    if (JSON_MODE) out(undefined, payload);
+    else
+      out(
+        `pending ask → ${payload.to} thread ${payload.thread_id}` +
+          (payload.at ? ` (since ${payload.at})` : "") +
+          `\nresume: ${payload.resume}`,
+      );
+    return;
+  }
 
   if (flags.resume || positional[0] === "resume") {
     const pending = loadPendingAsk();
     if (!pending?.thread_id) fail("no pending ask — run: sup ask @peer \"…\"", "no_pending_ask");
     const to = normalizeHandle(pending.to);
-    const msgs = await waitThreadReply(key, to, pending.thread_id, waitSec);
-    if (msgs.length > 0) {
+    const timeoutAt = new Date(Date.now() + waitSec * 1000).toISOString();
+    if (!JSON_MODE) {
+      out(
+        `waiting up to ${waitSec}s for reply from @${to} on ${pending.thread_id} (timeout_at ${timeoutAt})`,
+      );
+    }
+    const result = await waitThreadReply(key, to, pending.thread_id, waitSec);
+    if (result.msgs.length > 0) {
       clearPendingAsk();
-      const payload = { resumed: pending, reply: msgs.map(envelope), thread_id: pending.thread_id, timed_out: false };
+      const payload = {
+        state: "answered",
+        timed_out: false,
+        resumed: pending,
+        reply: result.msgs.map(envelope),
+        thread_id: pending.thread_id,
+        last_checked_at: result.last_checked_at,
+        timeout_at: result.timeout_at,
+        waited_ms: result.waited_ms,
+        retry_after_ms: 0,
+      };
       if (JSON_MODE) out(undefined, payload);
       else {
         out(`(resumed ask → @${to}, thread ${pending.thread_id})`);
-        printMessages(msgs);
+        printMessages(result.msgs);
       }
       return;
     }
-    const payload = { resumed: pending, reply: [], thread_id: pending.thread_id, timed_out: true };
+    const payload = {
+      ...askPendingPayload(pending, {
+        state: "timed_out",
+        timed_out: true,
+        resumed: pending,
+        reply: [],
+        last_checked_at: result.last_checked_at,
+        timeout_at: result.timeout_at,
+        waited_ms: result.waited_ms,
+        retry_after_ms: 0,
+      }),
+    };
     if (JSON_MODE) out(undefined, payload);
-    else out(`(still no reply in thread ${pending.thread_id} — sup ask --resume)`);
+    else
+      out(
+        `(timed_out after ${waitSec}s — thread ${pending.thread_id} still pending)\n` +
+          `last_checked_at ${payload.last_checked_at}\n` +
+          `resume again: ${payload.resume}`,
+      );
     return;
   }
 
   const to = normalizeHandle(flags.to || positional[0]);
   const text = flags.text || positional.slice(1).join(" ");
-  if (!to) fail('recipient required: sup ask @peer "question" (or: sup ask --resume)');
+  if (!to) fail('recipient required: sup ask @peer "question" (or: sup ask --resume / --status)');
   const body = attachThreadFields({ to, text }, flags, { autoIdem: true });
   if (!text && !body.payload) fail('message or --payload required: sup ask @peer "question"');
   const headers = {};
@@ -552,57 +672,84 @@ async function cmdAsk(flags, positional) {
     thread_id: sent.thread_id,
     status: sent.status,
     duplicate: Boolean(sent.duplicate),
-    text: text.slice(0, 200),
+    text: (text || "").slice(0, 200),
   });
   if (sent.status === "queued") {
-    savePendingAsk({
+    const pending = {
       to,
-      text: text.slice(0, 500),
+      text: (text || "").slice(0, 500),
       thread_id: sent.thread_id,
       request_id: sent.request_id,
       client_message_id: body.client_message_id,
       at: new Date().toISOString(),
-    });
+    };
+    savePendingAsk(pending);
     out(
-      `queued for ${sent.to} (waiting for friend accept). thread ${sent.thread_id || "?"} — resume later: sup ask --resume`,
-      { ...sent, client_message_id: body.client_message_id, reply: null, timed_out: false },
+      `queued for ${sent.to} (waiting for friend accept). thread ${sent.thread_id || "?"} — resume: sup ask --resume --wait ${ASK_DEFAULT_WAIT_SEC}`,
+      {
+        ...sent,
+        client_message_id: body.client_message_id,
+        state: "queued",
+        reply: null,
+        timed_out: false,
+        resume: `sup ask --resume --wait ${ASK_DEFAULT_WAIT_SEC} --json`,
+      },
     );
     return;
   }
   const thread = sent.thread_id || body.thread_id;
   savePendingAsk({
     to,
-    text: text.slice(0, 500),
+    text: (text || "").slice(0, 500),
     thread_id: thread,
     message_id: sent.id,
     client_message_id: body.client_message_id,
     at: new Date().toISOString(),
   });
-  const msgs = await waitThreadReply(key, to, thread, waitSec);
-  if (msgs.length > 0) {
+  const timeoutAt = new Date(Date.now() + waitSec * 1000).toISOString();
+  if (!JSON_MODE) {
+    out(`waiting up to ${waitSec}s for reply on ${thread} (timeout_at ${timeoutAt})`);
+  }
+  const result = await waitThreadReply(key, to, thread, waitSec);
+  if (result.msgs.length > 0) {
     clearPendingAsk();
     const payload = {
+      state: "answered",
       sent: { ...sent, client_message_id: body.client_message_id },
-      reply: msgs.map(envelope),
+      reply: result.msgs.map(envelope),
       thread_id: thread,
       timed_out: false,
+      last_checked_at: result.last_checked_at,
+      timeout_at: result.timeout_at,
+      waited_ms: result.waited_ms,
+      retry_after_ms: 0,
     };
     if (JSON_MODE) out(undefined, payload);
     else {
-      out(`→ ${sent.to}: ${text} (thread ${thread})`);
-      printMessages(msgs);
+      out(`→ ${sent.to}: ${text || "[payload]"} (thread ${thread})`);
+      printMessages(result.msgs);
     }
     return;
   }
   const payload = {
+    state: "timed_out",
     sent: { ...sent, client_message_id: body.client_message_id },
     reply: [],
     thread_id: thread,
     timed_out: true,
-    resume: "sup ask --resume",
+    last_checked_at: result.last_checked_at,
+    timeout_at: result.timeout_at,
+    waited_ms: result.waited_ms,
+    retry_after_ms: 0,
+    resume: `sup ask --resume --wait ${ASK_DEFAULT_WAIT_SEC} --json`,
   };
   if (JSON_MODE) out(undefined, payload);
-  else out(`(no reply in thread ${thread || "?"} within ${waitSec}s — resume: sup ask --resume)`);
+  else
+    out(
+      `(timed_out after ${waitSec}s — thread ${thread || "?"})\n` +
+        `last_checked_at ${payload.last_checked_at}\n` +
+        `resume: ${payload.resume}  (do not resend)`,
+    );
 }
 
 async function cmdWebhook(flags, positional) {
@@ -1426,8 +1573,9 @@ Identity:
 Messaging:
   sup send @peer "message" [--kind text|json|task] [--payload '{…}'] [--grant ID]
   sup queue @peer "message"           reach anyone (request+hold if needed)
-  sup ask @peer "…" [--wait N]        queue/send + wait on that thread
-  sup ask --resume                    continue waiting on last pending ask
+  sup ask @peer "…" [--wait N]        queue/send + wait (default 60s)
+  sup ask --resume [--wait N]         continue wait; always returns timed_out|answered
+  sup ask --status                    show pending ask without waiting
   sup composing @peer [--thread ID]   best-effort "typing" signal (~10s)
   sup presence @peer                  peer status + composing?
   sup message get msg_…               canonical status by id
@@ -1492,6 +1640,8 @@ Global flags:
 
 Config: ${CONFIG_PATH}
 Network: ${NETWORK_URL}
+If \`sup\` is not found after npm i -g: export PATH="$(npm prefix -g)/bin:$PATH"
+  or run: npx @marshell/sup@latest …
 `;
   out(help, {
     version: VERSION,

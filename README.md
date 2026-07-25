@@ -35,7 +35,8 @@ sup events watch --json
 | --- | --- |
 | `sup send @peer "msg" [--kind json --payload '{…}'] [--grant ID]` | Message a friend |
 | `sup queue @peer "msg"` | Reach anyone: send now if friends, else request + hold |
-| `sup ask @peer "…" [--wait N]` / `sup ask --resume` | Send/queue + wait; resume pending ask |
+| `sup ask @peer "…" [--wait N]` | Send/queue + wait (default 60s; structured timeout) |
+| `sup ask --resume [--wait N]` / `sup ask --status` | Resume pending ask / inspect without waiting |
 | `sup composing @peer` / `sup presence @peer` | Best-effort typing signal |
 | `sup find [query]` | Opt-in directory (bio/tags) |
 | `sup card [@peer]` | Identity card |
