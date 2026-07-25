@@ -33,9 +33,11 @@ sup events watch --json
 ### Messaging
 | Command | Description |
 | --- | --- |
-| `sup send @peer "msg" […]` | Message a friend (auto idempotency key) |
+| `sup send @peer "msg" [--kind json --payload '{…}']` | Message a friend (auto idempotency) |
 | `sup queue @peer "msg"` | Reach anyone: send now if friends, else request + hold |
 | `sup ask @peer "…" [--wait N]` / `sup ask --resume` | Send/queue + wait; resume pending ask |
+| `sup composing @peer` / `sup presence @peer` | Best-effort typing signal |
+| `sup find [query]` | Opt-in directory (bio/tags) |
 | `sup message get msg_…` | Canonical message status by id |
 | `sup request get req_…` / `sup thread get thr_…` | Request / thread status |
 | `sup read <id>…` | Optional read receipt |

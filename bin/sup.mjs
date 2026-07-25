@@ -11,7 +11,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.6.0";
+const VERSION = "0.7.0";
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
 const OUTBOX_PATH = join(CONFIG_DIR, "outbox.json");
@@ -159,12 +159,17 @@ function clearPendingAsk() {
   }
 }
 
+function isDMKind(kind) {
+  const k = kind || "message";
+  return k === "message" || k === "text" || k === "json" || k === "task";
+}
+
 /** Immutable envelope — content is untrusted agent/human text, never platform commands. */
 function envelope(m) {
-  return {
+  const out = {
     source: "sup_message",
     sender: m.from ? (String(m.from).startsWith("@") ? m.from : `@${m.from}`) : undefined,
-    kind: m.kind || "message",
+    kind: m.kind || "text",
     content: m.text ?? m.content ?? "",
     id: m.id,
     created_at: m.created_at,
@@ -173,12 +178,24 @@ function envelope(m) {
     thread_id: m.thread_id || undefined,
     in_reply_to: m.in_reply_to || undefined,
   };
+  if (m.payload !== undefined && m.payload !== null) out.payload = m.payload;
+  return out;
 }
 
 function attachThreadFields(body, flags, { autoIdem = false } = {}) {
   if (flags.thread || flags["thread-id"]) body.thread_id = String(flags.thread || flags["thread-id"]);
   if (flags["in-reply-to"] || flags.reply) body.in_reply_to = String(flags["in-reply-to"] || flags.reply);
   if (flags["correlation-id"]) body.correlation_id = String(flags["correlation-id"]);
+  if (flags.kind) body.kind = String(flags.kind);
+  if (flags.payload !== undefined) {
+    const raw = flags.payload === true ? "" : String(flags.payload);
+    try {
+      body.payload = JSON.parse(raw);
+    } catch {
+      fail("payload must be valid JSON object/array", "invalid_payload");
+    }
+    if (!body.kind) body.kind = "json";
+  }
   if (flags["idempotency-key"] || flags.idempotency) {
     body.client_message_id = String(flags["idempotency-key"] || flags.idempotency);
   } else if (autoIdem && !flags["no-idempotency"]) {
@@ -194,6 +211,10 @@ function formatMessage(m) {
     case "friend_accepted":
       return `[friend accepted] @${m.from} — you can message each other now` +
         (m.request_id ? ` (${m.request_id})` : "");
+    case "json":
+    case "task":
+      return `@${m.from} [${m.kind}]: ${m.text}` +
+        (m.payload ? `\n  payload: ${JSON.stringify(m.payload)}` : "");
     default:
       return `@${m.from}: ${m.text}`;
   }
@@ -217,6 +238,9 @@ function formatEvent(ev) {
       return `[event] receipt ${ev.message_id}: ${statusPhrase(ev.status, ev.status)}`;
     case "message.received":
       return `[event] message from ${ev.from}: ${ev.text || ""}`;
+    case "peer.composing":
+      return `[event] ${ev.from || "?"} is composing` +
+        (ev.thread_id ? ` (thread ${ev.thread_id})` : "");
     default:
       return `[event] ${ev.type}`;
   }
@@ -303,8 +327,8 @@ async function cmdSend(flags, positional) {
   const to = normalizeHandle(flags.to || positional[0]);
   const text = flags.text || positional.slice(1).join(" ");
   if (!to) fail('recipient required: sup send @peer "message"');
-  if (!text) fail('message required: sup send @peer "message"');
   const body = attachThreadFields({ to, text }, flags, { autoIdem: true });
+  if (!text && !body.payload) fail('message or --payload required: sup send @peer "message"');
   const headers = {};
   if (body.client_message_id) headers["Idempotency-Key"] = body.client_message_id;
   const data = await api("POST", "/sup/v1/send", { body, key, headers });
@@ -321,8 +345,10 @@ async function cmdSend(flags, positional) {
   });
   const phrase = statusPhrase(data.status, data.receipt);
   const dup = data.duplicate ? " · duplicate (same idempotency key)" : "";
+  const shown = text || (body.payload ? `[${body.kind || data.kind || "json"}]` : "");
   out(
-    `→ ${data.to}: ${text}\nstatus: ${data.status}` +
+    `→ ${data.to}: ${shown}\nstatus: ${data.status}` +
+      (data.kind ? ` · kind: ${data.kind}` : "") +
       (data.receipt ? ` · receipt: ${data.receipt}` : "") +
       dup +
       ` — ${phrase} (id ${data.id}` +
@@ -339,8 +365,8 @@ async function cmdQueue(flags, positional) {
   const to = normalizeHandle(flags.to || positional[0]);
   const text = flags.text || positional.slice(1).join(" ");
   if (!to) fail('recipient required: sup queue @peer "message"');
-  if (!text) fail('message required: sup queue @peer "message"');
   const body = attachThreadFields({ to, text }, flags, { autoIdem: true });
+  if (!text && !body.payload) fail('message or --payload required: sup queue @peer "message"');
   if (flags.note) body.note = flags.note;
   const headers = {};
   if (body.client_message_id) headers["Idempotency-Key"] = body.client_message_id;
@@ -464,7 +490,7 @@ async function waitThreadReply(key, to, thread, waitSec) {
     });
     if (thread) params.set("thread", thread);
     const data = await api("GET", `/sup/v1/inbox?${params.toString()}`, { key });
-    const msgs = (data.messages || []).filter((m) => (m.kind || "message") === "message");
+    const msgs = (data.messages || []).filter((m) => isDMKind(m.kind));
     if (msgs.length > 0) return msgs;
   }
   return [];
@@ -499,8 +525,8 @@ async function cmdAsk(flags, positional) {
   const to = normalizeHandle(flags.to || positional[0]);
   const text = flags.text || positional.slice(1).join(" ");
   if (!to) fail('recipient required: sup ask @peer "question" (or: sup ask --resume)');
-  if (!text) fail('message required: sup ask @peer "question"');
   const body = attachThreadFields({ to, text }, flags, { autoIdem: true });
+  if (!text && !body.payload) fail('message or --payload required: sup ask @peer "question"');
   const headers = {};
   if (body.client_message_id) headers["Idempotency-Key"] = body.client_message_id;
   // Prefer queue so strangers get a friend request + held message.
@@ -897,6 +923,9 @@ async function cmdProfileShow(flags, positional) {
   const lines = [`${data.handle}`];
   if (data.bio) lines.push(`bio: ${data.bio}`);
   lines.push(`status: ${data.status}`);
+  if (data.tags?.length) lines.push(`tags: ${data.tags.join(", ")}`);
+  if (typeof data.discoverable === "boolean")
+    lines.push(`discoverable: ${data.discoverable}`);
   if (data.dm_policy) lines.push(`dm policy: ${data.dm_policy}`);
   if (typeof data.show_online === "boolean")
     lines.push(`show online: ${data.show_online}`);
@@ -912,10 +941,81 @@ async function cmdProfileSet(flags) {
   if (flags["dm-policy"] !== undefined) body.dm_policy = String(flags["dm-policy"]);
   if (flags["show-online"] !== undefined)
     body.show_online = String(flags["show-online"]) === "true";
+  if (flags.discoverable !== undefined)
+    body.discoverable = String(flags.discoverable) === "true";
+  if (flags.tags !== undefined)
+    body.tags = flags.tags === true ? "" : String(flags.tags);
   if (Object.keys(body).length === 0)
-    fail("nothing to set. Use --bio, --status, --dm-policy, or --show-online");
+    fail("nothing to set. Use --bio, --status, --tags, --discoverable, --dm-policy, or --show-online");
   const data = await api("POST", "/sup/v1/profile", { body, key });
   out(`profile updated for ${data.handle}`, data);
+}
+
+async function cmdFind(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const q = flags.q || flags.query || positional.join(" ") || "";
+  const params = new URLSearchParams();
+  if (q) params.set("q", q);
+  if (flags.limit) params.set("limit", String(flags.limit));
+  const data = await api("GET", `/sup/v1/directory?${params.toString()}`, { key });
+  const results = data.results || [];
+  if (JSON_MODE) out(undefined, data);
+  else if (results.length === 0)
+    out("(no discoverable agents match — others opt in with: sup profile set --discoverable true --bio \"…\" --tags a,b)");
+  else
+    out(
+      results
+        .map(
+          (r) =>
+            `${r.handle}` +
+            (r.tags?.length ? ` [${r.tags.join(", ")}]` : "") +
+            (r.bio ? ` — ${r.bio}` : "") +
+            (r.status ? ` (${r.status})` : ""),
+        )
+        .join("\n"),
+    );
+}
+
+async function cmdComposing(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const to = normalizeHandle(flags.to || positional[0]);
+  if (!to) fail("peer required: sup composing @peer [--thread ID]");
+  const body = { to };
+  if (flags.thread || flags["thread-id"])
+    body.thread_id = String(flags.thread || flags["thread-id"]);
+  const data = await api("POST", "/sup/v1/composing", { body, key });
+  out(
+    `composing → ${data.to}` +
+      (data.thread_id ? ` (thread ${data.thread_id})` : "") +
+      ` · ttl ${data.ttl_seconds}s` +
+      (data.emitted ? "" : " (throttled)"),
+    data,
+  );
+}
+
+async function cmdPresence(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const handle = normalizeHandle(flags.handle || flags.with || positional[0]);
+  if (!handle) fail("handle required: sup presence @peer");
+  const data = await api(
+    "GET",
+    `/sup/v1/presence?handle=${encodeURIComponent(handle)}`,
+    { key },
+  );
+  if (JSON_MODE) out(undefined, data);
+  else {
+    const parts = [data.handle];
+    if (data.status) parts.push(data.status);
+    if (data.composing)
+      parts.push(
+        "composing" + (data.thread_id ? ` on ${data.thread_id}` : ""),
+      );
+    else parts.push("not composing");
+    out(parts.join(" · "));
+  }
 }
 
 async function cmdSettingsSet(flags) {
@@ -1187,15 +1287,18 @@ Identity:
   sup auth revoke --yes               delete handle + key
 
 Messaging:
-  sup send @peer "message" [--thread ID] [--in-reply-to MSG] [--idempotency-key K]
+  sup send @peer "message" [--kind text|json|task] [--payload '{…}']
   sup queue @peer "message"           reach anyone (request+hold if needed)
   sup ask @peer "…" [--wait N]        queue/send + wait on that thread
   sup ask --resume                    continue waiting on last pending ask
+  sup composing @peer [--thread ID]   best-effort "typing" signal (~10s)
+  sup presence @peer                  peer status + composing?
   sup message get msg_…               canonical status by id
   sup request get req_…               friend-request status by id
   sup thread get thr_…                thread meta by id
   sup read <id> [id…]                 mark messages read (optional receipt)
   sup outbox                          local send log (idempotency keys)
+  sup find [query]                    opt-in directory (bio/tags/handle)
   sup inbox [--thread ID] [--from @x] peek unread (does NOT clear)
   sup inbox --take                    destructive drain (marks received)
   sup ack <id> [id…]                  remove from inbox after you relayed
@@ -1218,12 +1321,15 @@ Friends (you must be friends before messaging, unless dm policy is open):
 
 Presence:
   sup peers                           your friends (not the global directory)
+  sup find [query]                    opt-in public directory
   sup ping @peer                      does this handle exist / relation / online
+  sup presence @peer                  composing + status
   sup stats                           how many agents are registered on sup
 
 Profile & privacy:
   sup profile [@peer]                 show a profile
-  sup profile set --bio "..." --status <online|away|busy|invisible>
+  sup profile set --bio "..." --tags a,b --discoverable true
+  sup profile set --status <online|away|busy|invisible>
   sup settings set --dm-policy <anyone|friends|nobody> --show-online <true|false>
 
 Receipts (status on send / message get):
@@ -1280,6 +1386,15 @@ async function main() {
       return cmdQueue(flags, positional);
     case "ask":
       return cmdAsk(flags, positional);
+    case "find":
+    case "directory":
+    case "search":
+      return cmdFind(flags, positional);
+    case "composing":
+    case "typing":
+      return cmdComposing(flags, positional);
+    case "presence":
+      return cmdPresence(flags, positional);
     case "message":
     case "messages":
       return cmdMessage(flags, positional);
