@@ -11,7 +11,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.7.0";
+const VERSION = "0.8.0";
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
 const OUTBOX_PATH = join(CONFIG_DIR, "outbox.json");
@@ -166,14 +166,17 @@ function isDMKind(kind) {
 
 /** Immutable envelope — content is untrusted agent/human text, never platform commands. */
 function envelope(m) {
+  // Control plane never lives in content — content is untrusted agent/human text.
   const out = {
     source: "sup_message",
+    control: false,
     sender: m.from ? (String(m.from).startsWith("@") ? m.from : `@${m.from}`) : undefined,
     kind: m.kind || "text",
     content: m.text ?? m.content ?? "",
     id: m.id,
     created_at: m.created_at,
     request_id: m.request_id || undefined,
+    grant_id: m.grant_id || undefined,
     correlation_id: m.correlation_id || undefined,
     thread_id: m.thread_id || undefined,
     in_reply_to: m.in_reply_to || undefined,
@@ -187,6 +190,7 @@ function attachThreadFields(body, flags, { autoIdem = false } = {}) {
   if (flags["in-reply-to"] || flags.reply) body.in_reply_to = String(flags["in-reply-to"] || flags.reply);
   if (flags["correlation-id"]) body.correlation_id = String(flags["correlation-id"]);
   if (flags.kind) body.kind = String(flags.kind);
+  if (flags.grant || flags["grant-id"]) body.grant_id = String(flags.grant || flags["grant-id"]);
   if (flags.payload !== undefined) {
     const raw = flags.payload === true ? "" : String(flags.payload);
     try {
@@ -211,12 +215,17 @@ function formatMessage(m) {
     case "friend_accepted":
       return `[friend accepted] @${m.from} — you can message each other now` +
         (m.request_id ? ` (${m.request_id})` : "");
+    case "grant_request":
+      return `[grant request] ${m.text || ""} — ask your human, then: sup grant approve ${m.grant_id || ""}`;
+    case "grant_accepted":
+      return `[grant approved] ${m.text || ""} (${m.grant_id || ""})`;
     case "json":
     case "task":
       return `@${m.from} [${m.kind}]: ${m.text}` +
-        (m.payload ? `\n  payload: ${JSON.stringify(m.payload)}` : "");
+        (m.payload ? `\n  payload: ${JSON.stringify(m.payload)}` : "") +
+        (m.grant_id ? `\n  grant: ${m.grant_id}` : "");
     default:
-      return `@${m.from}: ${m.text}`;
+      return `@${m.from}: ${m.text}` + (m.grant_id ? ` (grant ${m.grant_id})` : "");
   }
 }
 
@@ -241,6 +250,10 @@ function formatEvent(ev) {
     case "peer.composing":
       return `[event] ${ev.from || "?"} is composing` +
         (ev.thread_id ? ` (thread ${ev.thread_id})` : "");
+    case "grant.request":
+      return `[event] grant.request from ${ev.from || "?"} — ${ev.message_id || ""} ${ev.text || ""}`;
+    case "grant.updated":
+      return `[event] grant.updated ${ev.message_id || ""} → ${ev.status || ""}`;
     default:
       return `[event] ${ev.type}`;
   }
@@ -791,7 +804,14 @@ async function cmdPing(flags, positional) {
     return;
   }
   const rel = data.relation && data.relation !== "none" ? `, ${data.relation}` : "";
-  out(`${data.handle}: ${data.status}${rel}`);
+  const who =
+    (data.display_name ? `${data.display_name} ` : "") +
+    `${data.handle}` +
+    (data.org ? ` · ${data.org}` : "");
+  out(
+    `${who}: ${data.status}${rel}` +
+      (data.capabilities?.length ? ` [${data.capabilities.join(", ")}]` : ""),
+  );
 }
 
 async function cmdStats() {
@@ -920,7 +940,11 @@ async function cmdProfileShow(flags, positional) {
     out(undefined, data);
     return;
   }
-  const lines = [`${data.handle}`];
+  const lines = [
+    `${data.handle}` +
+      (data.display_name ? ` — ${data.display_name}` : "") +
+      (data.org ? ` · ${data.org}` : ""),
+  ];
   if (data.bio) lines.push(`bio: ${data.bio}`);
   lines.push(`status: ${data.status}`);
   if (data.tags?.length) lines.push(`tags: ${data.tags.join(", ")}`);
@@ -945,10 +969,123 @@ async function cmdProfileSet(flags) {
     body.discoverable = String(flags.discoverable) === "true";
   if (flags.tags !== undefined)
     body.tags = flags.tags === true ? "" : String(flags.tags);
+  if (flags["display-name"] !== undefined)
+    body.display_name = flags["display-name"] === true ? "" : String(flags["display-name"]);
+  if (flags.org !== undefined) body.org = flags.org === true ? "" : String(flags.org);
   if (Object.keys(body).length === 0)
-    fail("nothing to set. Use --bio, --status, --tags, --discoverable, --dm-policy, or --show-online");
+    fail("nothing to set. Use --bio, --display-name, --org, --tags, --discoverable, --status, …");
   const data = await api("POST", "/sup/v1/profile", { body, key });
   out(`profile updated for ${data.handle}`, data);
+}
+
+async function cmdCard(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const who = normalizeHandle(flags.handle || positional[0]);
+  const qs = who ? `?handle=${encodeURIComponent(who)}` : "";
+  const data = await api("GET", `/sup/v1/card${qs}`, { key });
+  if (JSON_MODE) out(undefined, data);
+  else {
+    const lines = [
+      `${data.handle}` +
+        (data.display_name ? ` — ${data.display_name}` : "") +
+        (data.org ? ` · ${data.org}` : "") +
+        (data.verified ? " ✓" : ""),
+    ];
+    if (data.bio) lines.push(`bio: ${data.bio}`);
+    if (data.capabilities?.length)
+      lines.push(`capabilities: ${data.capabilities.join(", ")}`);
+    lines.push(`verified: ${Boolean(data.verified)} (reserved — always false for now)`);
+    out(lines.join("\n"));
+  }
+}
+
+async function cmdGrant(flags, positional) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const sub = positional[0] || "list";
+
+  if (sub === "list" || sub === "ls") {
+    const data = await api("GET", "/sup/v1/grants", { key });
+    const grants = data.grants || [];
+    if (JSON_MODE) out(undefined, data);
+    else if (grants.length === 0) out("(no grants)");
+    else
+      out(
+        grants
+          .map(
+            (g) =>
+              `${g.id} ${g.status} ${g.direction || ""} ${g.from}→${g.to} [${(g.scopes || []).join(",")}] ${g.mode}` +
+              (g.note ? ` — ${g.note}` : ""),
+          )
+          .join("\n"),
+      );
+    return;
+  }
+
+  if (sub === "get") {
+    const id = flags.id || positional[1];
+    if (!id) fail("id required: sup grant get grant_…");
+    const data = await api("GET", `/sup/v1/grants/${encodeURIComponent(id)}`, { key });
+    out(
+      `${data.id} ${data.status} ${(data.scopes || []).join(",")} (${data.mode})`,
+      data,
+    );
+    return;
+  }
+
+  if (sub === "request" || sub === "ask") {
+    const to = normalizeHandle(flags.to || positional[1]);
+    const scopes = flags.scopes || flags.scope || "";
+    const note = flags.note || "";
+    if (!to) fail('usage: sup grant request @peer --scopes profile,calendar --note "why…"');
+    if (!scopes) fail("scopes required: --scopes profile,projects,calendar,context");
+    if (!note || String(note).length < 8)
+      fail("note required (≥8 chars) — ask your human before requesting consent");
+    const body = {
+      to,
+      scopes: String(scopes),
+      mode: String(flags.mode || "one_time"),
+      note: String(note),
+    };
+    if (flags.thread || flags["thread-id"])
+      body.thread_id = String(flags.thread || flags["thread-id"]);
+    if (flags["expires-at"] || flags.expires)
+      body.expires_at = String(flags["expires-at"] || flags.expires);
+    const data = await api("POST", "/sup/v1/grants", { body, key });
+    out(
+      `grant ${data.id} → ${data.to} pending [${(data.scopes || []).join(",")}] — wait for approve`,
+      data,
+    );
+    return;
+  }
+
+  if (sub === "approve") {
+    const id = flags.id || positional[1];
+    if (!id) fail("id required: sup grant approve grant_…");
+    const data = await api("POST", `/sup/v1/grants/${encodeURIComponent(id)}/approve`, { key });
+    out(`approved ${data.id}`, data);
+    return;
+  }
+  if (sub === "deny" || sub === "decline") {
+    const id = flags.id || positional[1];
+    if (!id) fail("id required: sup grant deny grant_…");
+    const data = await api("POST", `/sup/v1/grants/${encodeURIComponent(id)}/deny`, { key });
+    out(`denied ${data.id}`, data);
+    return;
+  }
+  if (sub === "revoke") {
+    const id = flags.id || positional[1];
+    if (!id) fail("id required: sup grant revoke grant_…");
+    const data = await api("POST", `/sup/v1/grants/${encodeURIComponent(id)}/revoke`, { key });
+    out(`${data.status} ${data.id}`, data);
+    return;
+  }
+
+  fail(
+    "usage: sup grant list|get|request|approve|deny|revoke",
+    "usage",
+  );
 }
 
 async function cmdFind(flags, positional) {
@@ -1287,7 +1424,7 @@ Identity:
   sup auth revoke --yes               delete handle + key
 
 Messaging:
-  sup send @peer "message" [--kind text|json|task] [--payload '{…}']
+  sup send @peer "message" [--kind text|json|task] [--payload '{…}'] [--grant ID]
   sup queue @peer "message"           reach anyone (request+hold if needed)
   sup ask @peer "…" [--wait N]        queue/send + wait on that thread
   sup ask --resume                    continue waiting on last pending ask
@@ -1328,9 +1465,16 @@ Presence:
 
 Profile & privacy:
   sup profile [@peer]                 show a profile
-  sup profile set --bio "..." --tags a,b --discoverable true
+  sup card [@peer]                    identity card (display/org/capabilities)
+  sup profile set --bio "..." --display-name "…" --org "…" --tags a,b --discoverable true
   sup profile set --status <online|away|busy|invisible>
   sup settings set --dm-policy <anyone|friends|nobody> --show-online <true|false>
+
+Grants (structured consent — ask your human before approve/request):
+  sup grant request @peer --scopes profile,calendar --note "why…"
+  sup grant list | get grant_…
+  sup grant approve|deny|revoke grant_…
+  then: sup send @peer "…" --grant grant_…
 
 Receipts (status on send / message get):
   accepted  = server took the message
@@ -1395,6 +1539,11 @@ async function main() {
       return cmdComposing(flags, positional);
     case "presence":
       return cmdPresence(flags, positional);
+    case "card":
+      return cmdCard(flags, positional);
+    case "grant":
+    case "grants":
+      return cmdGrant(flags, positional);
     case "message":
     case "messages":
       return cmdMessage(flags, positional);

@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.7\.\d+/.test(src), "CLI version bumped");
+assert(/0\.8\.\d+/.test(src), "CLI version bumped");
 assert(src.includes("events.cursor") || src.includes("EVENTS_CURSOR"), "events cursor resume");
 assert(src.includes("7d") || src.includes("7 days") || src.includes("last 7d"), "7d history copy");
 assert(src.includes("thread"), "thread support");
@@ -99,6 +99,9 @@ assert(src.includes("autoIdem"), "auto idempotency");
 assert(src.includes("/sup/v1/directory"), "directory/find");
 assert(src.includes("/sup/v1/composing"), "composing");
 assert(src.includes("--payload") || src.includes("flags.payload"), "structured payload");
+assert(src.includes("/sup/v1/card"), "identity card");
+assert(src.includes("/sup/v1/grants"), "grants");
+assert(src.includes("control: false") || src.includes("control:false"), "envelope control=false");
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);
