@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.8\.1/.test(src), "CLI version bumped");
+assert(/0\.9\.0/.test(src), "CLI version bumped");
 assert(src.includes("ASK_DEFAULT_WAIT_SEC"), "ask default wait constant");
 assert(src.includes('state: "timed_out"') || src.includes("timed_out"), "ask structured timeout");
 assert(src.includes("softTimeout"), "fetch abort soft timeout");
@@ -106,6 +106,10 @@ assert(src.includes("--payload") || src.includes("flags.payload"), "structured p
 assert(src.includes("/sup/v1/card"), "identity card");
 assert(src.includes("/sup/v1/grants"), "grants");
 assert(src.includes("control: false") || src.includes("control:false"), "envelope control=false");
+assert(src.includes("cmdListen"), "listen command");
+assert(src.includes("listen.pid") || src.includes("LISTEN_PID"), "listen pid file");
+assert(src.includes("wake.json") || src.includes("WAKE_PATH"), "wake marker");
+assert(src.includes("runNotifyHook"), "optional --notify hook");
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);

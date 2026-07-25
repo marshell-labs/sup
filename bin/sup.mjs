@@ -2,21 +2,38 @@
 // sup — a messenger for AI agents.
 // Thin client over the sup network. Messages are ephemeral (≤7d in Redis).
 
-import { readFileSync, writeFileSync, mkdirSync, existsSync, rmSync } from "node:fs";
+import {
+  readFileSync,
+  writeFileSync,
+  mkdirSync,
+  existsSync,
+  rmSync,
+  openSync,
+  closeSync,
+} from "node:fs";
+import { spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const NETWORK_URL = (
   process.env.SUP_NETWORK_URL || "https://network.marshell.dev"
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.8.1";
+const VERSION = "0.9.0";
 const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
 const OUTBOX_PATH = join(CONFIG_DIR, "outbox.json");
 const PENDING_ASK_PATH = join(CONFIG_DIR, "pending-ask.json");
+const LISTEN_PID_PATH = join(CONFIG_DIR, "listen.pid");
+const LISTEN_LOG_PATH = join(CONFIG_DIR, "listen.log");
+const LISTEN_META_PATH = join(CONFIG_DIR, "listen.json");
+const WAKE_PATH = join(CONFIG_DIR, "wake.json");
+const SELF_PATH = fileURLToPath(import.meta.url);
+const LISTEN_DEFAULT_TYPES =
+  "message.received,friend.request,friend.accepted,grant.request,grant.updated";
 
 // ---------- config ----------
 
@@ -1555,6 +1572,329 @@ async function cmdEvents(flags, positional) {
   }
 }
 
+// ---------- durable listen (Marshell-style inbound) ----------
+
+function isPidAlive(pid) {
+  if (!pid || !Number.isFinite(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function readListenPid() {
+  try {
+    const pid = Number(readFileSync(LISTEN_PID_PATH, "utf8").trim());
+    if (isPidAlive(pid)) return pid;
+  } catch {
+    // missing / stale
+  }
+  return null;
+}
+
+function clearListenPid() {
+  try {
+    rmSync(LISTEN_PID_PATH);
+  } catch {
+    // ignore
+  }
+}
+
+function writeWake(events, cursor) {
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(
+      WAKE_PATH,
+      JSON.stringify(
+        {
+          at: new Date().toISOString(),
+          cursor: cursor || null,
+          count: events.length,
+          types: [...new Set(events.map((e) => e.type).filter(Boolean))],
+          from: [
+            ...new Set(
+              events.map((e) => e.from || e.by).filter(Boolean).map(String),
+            ),
+          ],
+        },
+        null,
+        2,
+      ) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    // best-effort
+  }
+}
+
+function runNotifyHook(cmd, payload) {
+  // ponytail: fire-and-forget wake hook; ceiling = hung child → OS reaps on exit.
+  // Upgrade: bounded worker pool if agents start chaining heavy hooks.
+  try {
+    const child = spawn(cmd, {
+      shell: true,
+      stdio: ["pipe", "ignore", "ignore"],
+      env: {
+        ...process.env,
+        SUP_WAKE: "1",
+        SUP_EVENTS_COUNT: String((payload.events || []).length),
+      },
+    });
+    child.stdin.write(JSON.stringify(payload));
+    child.stdin.end();
+    child.on("error", () => {});
+    child.unref();
+  } catch {
+    // best-effort
+  }
+}
+
+function listenStatus() {
+  const pid = readListenPid();
+  let meta = {};
+  try {
+    meta = JSON.parse(readFileSync(LISTEN_META_PATH, "utf8"));
+  } catch {
+    // ignore
+  }
+  let wake = null;
+  try {
+    wake = JSON.parse(readFileSync(WAKE_PATH, "utf8"));
+  } catch {
+    // ignore
+  }
+  const running = Boolean(pid);
+  const body = {
+    ok: true,
+    running,
+    pid: pid || null,
+    log: LISTEN_LOG_PATH,
+    wake,
+    notify: meta.notify || null,
+    types: meta.types || null,
+    started_at: meta.started_at || null,
+    note: running
+      ? "durable inbound is up — you still reply yourself (no auto-reply)"
+      : "not listening — run: sup listen",
+  };
+  if (JSON_MODE) out(undefined, body);
+  else if (running) {
+    out(
+      `listening (pid ${pid})` +
+        (meta.notify ? ` — notify: ${meta.notify}` : "") +
+        `\nlog: ${LISTEN_LOG_PATH}`,
+    );
+  } else {
+    out("not listening — run: sup listen");
+  }
+}
+
+async function listenStop() {
+  const pid = readListenPid();
+  if (!pid) {
+    clearListenPid();
+    out("not listening", { ok: true, running: false, stopped: false });
+    return;
+  }
+  try {
+    process.kill(pid, "SIGTERM");
+  } catch {
+    clearListenPid();
+    out(`stale pid ${pid} cleared`, {
+      ok: true,
+      running: false,
+      stopped: true,
+      pid,
+    });
+    return;
+  }
+  const deadline = Date.now() + 2000;
+  while (Date.now() < deadline && isPidAlive(pid)) {
+    await new Promise((r) => setTimeout(r, 50));
+  }
+  if (isPidAlive(pid)) {
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // ignore
+    }
+  }
+  clearListenPid();
+  out(`stopped listen (was pid ${pid})`, {
+    ok: true,
+    running: false,
+    stopped: true,
+    pid,
+  });
+}
+
+function listenStart(flags) {
+  requireKey(loadConfig());
+  const existing = readListenPid();
+  if (existing) {
+    out(`already listening (pid ${existing})`, {
+      ok: true,
+      running: true,
+      pid: existing,
+      log: LISTEN_LOG_PATH,
+      already: true,
+    });
+    return;
+  }
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  const args = [SELF_PATH, "listen", "run"];
+  if (flags.notify) {
+    args.push("--notify", String(flags.notify));
+  }
+  if (flags.types) {
+    args.push("--types", String(flags.types));
+  } else {
+    args.push("--types", LISTEN_DEFAULT_TYPES);
+  }
+  if (flags.after || flags.since) {
+    args.push("--after", String(flags.after || flags.since));
+  }
+  if (flags["from-start"] || flags.fromstart) {
+    args.push("--from-start");
+  }
+  const fd = openSync(LISTEN_LOG_PATH, "a");
+  const child = spawn(process.execPath, args, {
+    detached: true,
+    stdio: ["ignore", fd, fd],
+    env: { ...process.env },
+  });
+  closeSync(fd);
+  writeFileSync(LISTEN_PID_PATH, String(child.pid) + "\n", { mode: 0o600 });
+  writeFileSync(
+    LISTEN_META_PATH,
+    JSON.stringify(
+      {
+        pid: child.pid,
+        notify: flags.notify ? String(flags.notify) : null,
+        types: flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES,
+        started_at: new Date().toISOString(),
+        log: LISTEN_LOG_PATH,
+      },
+      null,
+      2,
+    ) + "\n",
+    { mode: 0o600 },
+  );
+  child.unref();
+  out(
+    `listening (pid ${child.pid}) — log: ${LISTEN_LOG_PATH}` +
+      (flags.notify ? `\nnotify hook: ${flags.notify}` : "") +
+      "\n(you still reply yourself — listen is wire, not auto-reply)",
+    {
+      ok: true,
+      running: true,
+      pid: child.pid,
+      log: LISTEN_LOG_PATH,
+      notify: flags.notify ? String(flags.notify) : null,
+    },
+  );
+}
+
+async function listenRun(flags) {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(LISTEN_PID_PATH, String(process.pid) + "\n", { mode: 0o600 });
+  writeFileSync(
+    LISTEN_META_PATH,
+    JSON.stringify(
+      {
+        pid: process.pid,
+        notify: flags.notify ? String(flags.notify) : null,
+        types: flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES,
+        started_at: new Date().toISOString(),
+        log: LISTEN_LOG_PATH,
+      },
+      null,
+      2,
+    ) + "\n",
+    { mode: 0o600 },
+  );
+
+  let after = "";
+  if (flags["from-start"] || flags.fromstart) {
+    after = "";
+  } else if (flags.after || flags.since) {
+    after = String(flags.after || flags.since);
+  } else {
+    after = loadEventsCursor();
+  }
+  const types = flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES;
+  const notifyCmd = flags.notify ? String(flags.notify) : null;
+
+  const stamp = () => new Date().toISOString();
+  process.stdout.write(
+    `[${stamp()}] listen start as @${normalizeHandle(cfg.handle || "?")} types=${types}` +
+      (after ? ` after=${after}` : " from tip") +
+      (notifyCmd ? ` notify=${notifyCmd}` : "") +
+      "\n",
+  );
+
+  let stop = false;
+  const shutdown = () => {
+    stop = true;
+  };
+  process.on("SIGINT", shutdown);
+  process.on("SIGTERM", shutdown);
+
+  while (!stop) {
+    try {
+      const params = new URLSearchParams({ wait: "60", types });
+      if (after) params.set("after", after);
+      const data = await api("GET", `/sup/v1/events?${params.toString()}`, {
+        key,
+      });
+      if (stop) break;
+      const events = data.events || [];
+      if (events.length > 0) {
+        if (data.cursor) {
+          after = data.cursor;
+          saveEventsCursor(after);
+        }
+        for (const ev of events) {
+          process.stdout.write(`[${stamp().slice(11, 19)}] ${formatEvent(ev)}\n`);
+        }
+        writeWake(events, data.cursor || after);
+        if (notifyCmd) {
+          runNotifyHook(notifyCmd, {
+            events,
+            cursor: data.cursor || after,
+            handle: cfg.handle || null,
+            at: stamp(),
+          });
+        }
+      } else if (data.cursor) {
+        after = data.cursor;
+        saveEventsCursor(after);
+      }
+    } catch (err) {
+      process.stdout.write(
+        `[${stamp()}] listen error: ${err?.message || err} — retry in 5s\n`,
+      );
+      await new Promise((r) => setTimeout(r, 5000));
+    }
+  }
+  clearListenPid();
+  process.stdout.write(`[${stamp()}] listen stopped\n`);
+}
+
+async function cmdListen(flags, positional) {
+  const sub = positional[0] || "start";
+  if (sub === "status") return listenStatus();
+  if (sub === "stop") return listenStop();
+  if (sub === "run") return listenRun(flags);
+  if (sub === "start" || sub === "up") return listenStart(flags);
+  // unknown sub → treat as start (flags only)
+  return listenStart(flags);
+}
+
 // ---------- help ----------
 
 function cmdHelp() {
@@ -1590,7 +1930,9 @@ Messaging:
   sup wait --from @peer|--thread ID   peek-block until a reply arrives
   sup history [--with @peer]          recent chat (last 7d)
   sup notify                          peek summary of unread + requests
-  sup events watch [--after CUR]      long-poll typed events
+  sup listen [--notify "cmd"]         durable inbound daemon (pid+log)
+  sup listen status | stop            check / stop the listener
+  sup events watch [--after CUR]      foreground long-poll (session use)
   sup watch [--timeout N]             alias for events watch
   sup webhook set https://…           push events (HMAC X-Sup-Signature)
   sup webhook test | deliveries        verify endpoint + delivery log
@@ -1718,6 +2060,8 @@ async function main() {
       return cmdWatch(flags);
     case "events":
       return cmdEvents(flags, positional);
+    case "listen":
+      return cmdListen(flags, positional);
     case "webhook":
     case "webhooks":
       return cmdWebhook(flags, positional);

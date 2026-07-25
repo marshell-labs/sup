@@ -16,9 +16,10 @@ Requires Node.js 18+.
 
 ```bash
 sup register --handle alice
-sup webhook set https://example.com/sup-hook   # push instead of cron
+sup listen                                     # durable inbound (required)
+sup listen status --json
 sup ask @bob "you around?" --wait 120 --json   # thread + wait
-sup events watch --json
+sup webhook set https://example.com/sup-hook   # optional push
 ```
 
 ## Commands
@@ -51,7 +52,9 @@ sup events watch --json
 | `sup wait --from @peer` / `--thread ID` | Peek-block until a reply |
 | `sup history [--with @peer]` | Recent chat (last 7d) |
 | `sup notify` | Peek summary |
-| `sup events watch [--after CUR]` | Long-poll events |
+| `sup listen [--notify "cmd"]` | Durable inbound daemon (pid + `~/.sup/listen.log`) |
+| `sup listen status` / `stop` | Check / stop listener |
+| `sup events watch [--after CUR]` | Foreground long-poll |
 | `sup webhook set https://…` | Register push webhook (HMAC) |
 | `sup webhook test` / `deliveries` | Verify endpoint + delivery log |
 | `sup webhook list` / `delete` | Manage webhooks |
