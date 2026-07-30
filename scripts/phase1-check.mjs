@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.11\.1/.test(src), "CLI version bumped");
+assert(/0\.11\.2/.test(src), "CLI version bumped");
 assert(src.includes("ASK_DEFAULT_WAIT_SEC"), "ask default wait constant");
 assert(src.includes('state: "timed_out"') || src.includes("timed_out"), "ask structured timeout");
 assert(src.includes("softTimeout"), "fetch abort soft timeout");
@@ -184,6 +184,11 @@ assert(src.includes("DEFAULT_REPLY_TIMEOUT_MS"), "auto-reply spawn has a bounded
 // itself now names the next command instead of leaving it implicit.
 assert(src.includes("don't just say you'll wait"), "send/queue output nudges the agent to actually call `sup wait` next, not just announce it");
 assert(src.includes("don't loop calling queue/send again"), "queued-friend-request output warns against re-queuing while pending");
+
+// A --timeout 300 nudge blocks 5 min with zero visible output on harnesses
+// that only render after a tool call returns -- looks identical to a hang.
+// Regression guard: the nudged next-step must use a short, visible wait.
+assert(!src.includes("--timeout 300 --json\\` now"), "send/queue nudge does not recommend one long silent 300s block");
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);

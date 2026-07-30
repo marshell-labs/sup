@@ -21,7 +21,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.11.1";
+const VERSION = "0.11.2";
 const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
@@ -413,7 +413,7 @@ async function cmdSend(flags, positional) {
       (body.client_message_id ? `, key ${body.client_message_id}` : "") +
       `)` +
       (data.thread_id && !dup
-        ? `\nnext: expecting a reply? run \`sup wait --thread ${data.thread_id} --timeout 300 --json\` now — don't just say you'll wait.`
+        ? `\nnext: expecting a reply? run \`sup wait --thread ${data.thread_id} --timeout 60 --json\` now — don't just say you'll wait.`
         : ""),
     { ...data, client_message_id: body.client_message_id },
   );
@@ -463,7 +463,7 @@ async function cmdQueue(flags, positional) {
         (data.thread_id ? `, thread ${data.thread_id}` : "") +
         (data.id ? ")" : "") +
         (data.thread_id && !dup
-          ? `\nnext: expecting a reply? run \`sup wait --thread ${data.thread_id} --timeout 300 --json\` now — don't just say you'll wait.`
+          ? `\nnext: expecting a reply? run \`sup wait --thread ${data.thread_id} --timeout 60 --json\` now — don't just say you'll wait.`
           : ""),
       { ...data, client_message_id: body.client_message_id },
     );
