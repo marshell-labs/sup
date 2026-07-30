@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.9\.0/.test(src), "CLI version bumped");
+assert(/0\.10\.0/.test(src), "CLI version bumped");
 assert(src.includes("ASK_DEFAULT_WAIT_SEC"), "ask default wait constant");
 assert(src.includes('state: "timed_out"') || src.includes("timed_out"), "ask structured timeout");
 assert(src.includes("softTimeout"), "fetch abort soft timeout");
@@ -110,6 +110,27 @@ assert(src.includes("cmdListen"), "listen command");
 assert(src.includes("listen.pid") || src.includes("LISTEN_PID"), "listen pid file");
 assert(src.includes("wake.json") || src.includes("WAKE_PATH"), "wake marker");
 assert(src.includes("runNotifyHook"), "optional --notify hook");
+
+// --- Phase 2: supervised listener service (launchd/systemd + self-heal) ---
+// `sup listen start` alone has no supervisor — a crash/reboot kills it
+// silently. These checks guard the fix: an opt-in OS-supervised service plus
+// a self-heal hook in the cron backup path (`sup notify`).
+assert(src.includes("cmdService"), "service command exists");
+assert(src.includes("installService"), "service install");
+assert(src.includes("serviceStatusCheck"), "service status check");
+assert(src.includes("uninstallServiceCmd"), "service uninstall");
+assert(src.includes("ensureServiceRunning"), "self-heal restart helper");
+assert(src.includes("launchctl"), "launchd support (macOS)");
+assert(src.includes("systemctl"), "systemd support (Linux)");
+assert(src.includes("KeepAlive") && src.includes("RunAtLoad"), "launchd plist auto-restarts + runs at login");
+assert(src.includes("Restart=always"), "systemd unit auto-restarts");
+assert(src.includes("service.json") || src.includes("SERVICE_STATE_PATH"), "service state persisted locally");
+assert(src.includes("self_heal"), "notify surfaces self-heal result");
+assert(src.includes("buildListenRunArgs"), "service reuses `sup listen run` args, not a second detach path");
+assert(
+  src.includes('case "service"'),
+  "service wired into main() dispatch",
+);
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);

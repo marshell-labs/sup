@@ -21,7 +21,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.9.0";
+const VERSION = "0.10.0";
 const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
@@ -1382,6 +1382,22 @@ async function cmdNotify() {
   const unread = items.length;
   const pending = who.requests_in ?? who.requests ?? 0;
   const pendingOut = who.requests_out ?? 0;
+
+  // Self-heal: `sup notify` is the cron backup path (runs every 1-2 min per
+  // the gateway skill), so it's also the natural place to notice a dead
+  // supervised listener and restart it before anyone has to ask.
+  let selfHeal;
+  if (!readListenPid()) {
+    const ensured = await ensureServiceRunning();
+    if (ensured.action === "restarted") {
+      selfHeal = ensured;
+      clearServiceErrorReport();
+    } else if (ensured.action === "error" && shouldReportServiceError(ensured.detail)) {
+      selfHeal = ensured;
+      markServiceError(ensured.detail);
+    }
+  }
+
   const summary = {
     handle: who.handle,
     online: Boolean(who.online),
@@ -1389,9 +1405,10 @@ async function cmdNotify() {
     pending_requests: pending,
     pending_out: pendingOut,
     friends: who.friends || 0,
-    has_activity: unread > 0 || pending > 0,
+    has_activity: unread > 0 || pending > 0 || Boolean(selfHeal),
     items: items.map(envelope),
   };
+  if (selfHeal) summary.self_heal = selfHeal;
   if (pending > 0 || pendingOut > 0) {
     try {
       const reqs = await api("GET", "/sup/v1/requests", { key });
@@ -1424,6 +1441,10 @@ async function cmdNotify() {
     return;
   }
   const parts = [];
+  if (selfHeal?.action === "restarted")
+    parts.push("listener had stopped — restarted the supervised service");
+  else if (selfHeal?.action === "error")
+    parts.push(`listener is down and could not self-restart (${selfHeal.detail}) — run: sup service status`);
   parts.push(`${who.handle}`);
   parts.push(unread > 0 ? `${unread} unread message${unread === 1 ? "" : "s"} (sup inbox — peek)` : "inbox clear");
   if (pending > 0)
@@ -1651,7 +1672,7 @@ function runNotifyHook(cmd, payload) {
   }
 }
 
-function listenStatus() {
+async function listenStatus() {
   const pid = readListenPid();
   let meta = {};
   try {
@@ -1666,6 +1687,10 @@ function listenStatus() {
     // ignore
   }
   const running = Boolean(pid);
+  const service = await serviceStatusCheck();
+  const serviceInfo = service.installed
+    ? { installed: true, platform: service.state.platform, running: Boolean(service.running) }
+    : { installed: false };
   const body = {
     ok: true,
     running,
@@ -1675,19 +1700,23 @@ function listenStatus() {
     notify: meta.notify || null,
     types: meta.types || null,
     started_at: meta.started_at || null,
+    service: serviceInfo,
     note: running
       ? "durable inbound is up — you still reply yourself (no auto-reply)"
-      : "not listening — run: sup listen",
+      : service.installed
+        ? "not listening — supervised service is installed and should self-heal on the next `sup notify`; force it now with: sup service status"
+        : "not listening — run: sup listen (or `sup service install` so it auto-restarts on crash/reboot)",
   };
   if (JSON_MODE) out(undefined, body);
   else if (running) {
     out(
       `listening (pid ${pid})` +
         (meta.notify ? ` — notify: ${meta.notify}` : "") +
+        (service.installed ? ` — service: installed (${service.state.platform})` : "") +
         `\nlog: ${LISTEN_LOG_PATH}`,
     );
   } else {
-    out("not listening — run: sup listen");
+    out(body.note);
   }
 }
 
@@ -1730,6 +1759,23 @@ async function listenStop() {
   });
 }
 
+/** Shared by the self-managed detached mode and the supervised service —
+ * both just run `sup listen run` with the same flags. */
+function buildListenRunArgs(flags) {
+  const args = ["listen", "run"];
+  if (flags.notify) {
+    args.push("--notify", String(flags.notify));
+  }
+  args.push("--types", flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES);
+  if (flags.after || flags.since) {
+    args.push("--after", String(flags.after || flags.since));
+  }
+  if (flags["from-start"] || flags.fromstart) {
+    args.push("--from-start");
+  }
+  return args;
+}
+
 function listenStart(flags) {
   requireKey(loadConfig());
   const existing = readListenPid();
@@ -1744,21 +1790,7 @@ function listenStart(flags) {
     return;
   }
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
-  const args = [SELF_PATH, "listen", "run"];
-  if (flags.notify) {
-    args.push("--notify", String(flags.notify));
-  }
-  if (flags.types) {
-    args.push("--types", String(flags.types));
-  } else {
-    args.push("--types", LISTEN_DEFAULT_TYPES);
-  }
-  if (flags.after || flags.since) {
-    args.push("--after", String(flags.after || flags.since));
-  }
-  if (flags["from-start"] || flags.fromstart) {
-    args.push("--from-start");
-  }
+  const args = [SELF_PATH, ...buildListenRunArgs(flags)];
   const fd = openSync(LISTEN_LOG_PATH, "a");
   const child = spawn(process.execPath, args, {
     detached: true,
@@ -1895,6 +1927,354 @@ async function cmdListen(flags, positional) {
   return listenStart(flags);
 }
 
+// ---------- supervised service (launchd/systemd) ----------
+//
+// `sup listen start` is a bare detached process — it has no supervisor, so
+// a crash, logout, or reboot kills it silently with nothing to restart it.
+// `sup service install` runs the same `sup listen run` under the OS's own
+// service manager instead, which is the actual fix for "my listener died
+// and I never noticed."
+
+const SERVICE_LABEL = "app.getsup.listen";
+const SERVICE_STATE_PATH = join(CONFIG_DIR, "service.json");
+const SERVICE_ERROR_PATH = join(CONFIG_DIR, "service-error.json");
+
+function detectServicePlatform() {
+  if (process.platform === "darwin") return "darwin";
+  if (process.platform === "linux") return "linux";
+  return "unsupported";
+}
+
+function currentUid() {
+  return typeof process.getuid === "function" ? process.getuid() : 0;
+}
+
+function readServiceState() {
+  try {
+    return JSON.parse(readFileSync(SERVICE_STATE_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function writeServiceState(state) {
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  writeFileSync(SERVICE_STATE_PATH, JSON.stringify(state, null, 2) + "\n", {
+    mode: 0o600,
+  });
+}
+
+function clearServiceState() {
+  try {
+    rmSync(SERVICE_STATE_PATH);
+  } catch {
+    // ignore
+  }
+}
+
+/** Dedupe repeated identical self-heal failures across `sup notify` ticks
+ * (every 1-2 min per the gateway skill) — report once, not on every peek. */
+function shouldReportServiceError(detail) {
+  try {
+    const prev = JSON.parse(readFileSync(SERVICE_ERROR_PATH, "utf8"));
+    return prev.detail !== detail;
+  } catch {
+    return true;
+  }
+}
+
+function markServiceError(detail) {
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(
+      SERVICE_ERROR_PATH,
+      JSON.stringify({ detail, at: new Date().toISOString() }, null, 2) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    // best-effort
+  }
+}
+
+function clearServiceErrorReport() {
+  try {
+    rmSync(SERVICE_ERROR_PATH);
+  } catch {
+    // ignore
+  }
+}
+
+function xmlEscape(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;")
+    .replace(/'/g, "&apos;");
+}
+
+function buildLaunchdPlist({ label, nodeBin, args, logPath, pathEnv }) {
+  const programArgs = [nodeBin, ...args]
+    .map((a) => `    <string>${xmlEscape(a)}</string>`)
+    .join("\n");
+  return `<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>${xmlEscape(label)}</string>
+  <key>ProgramArguments</key>
+  <array>
+${programArgs}
+  </array>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>${xmlEscape(logPath)}</string>
+  <key>StandardErrorPath</key><string>${xmlEscape(logPath)}</string>
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>${xmlEscape(pathEnv)}</string>
+  </dict>
+</dict>
+</plist>
+`;
+}
+
+function buildSystemdUnit({ nodeBin, args, pathEnv }) {
+  const execStart = [nodeBin, ...args]
+    .map((part) => (part.includes(" ") ? `"${part}"` : part))
+    .join(" ");
+  return `[Unit]
+Description=sup listener (agent2agent inbox watcher)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=${execStart}
+Restart=always
+RestartSec=5
+Environment=PATH=${pathEnv}
+
+[Install]
+WantedBy=default.target
+`;
+}
+
+function runCmd(cmd, args) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(cmd, args, { env: process.env });
+    } catch (error) {
+      resolve({ code: 1, stdout: "", stderr: error.message });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    child.stdout?.on("data", (d) => {
+      stdout += d.toString();
+    });
+    child.stderr?.on("data", (d) => {
+      stderr += d.toString();
+    });
+    child.on("close", (code) => resolve({ code: code ?? 1, stdout, stderr }));
+    child.on("error", (error) =>
+      resolve({ code: 1, stdout, stderr: error.message }),
+    );
+  });
+}
+
+async function installService(flags) {
+  requireKey(loadConfig());
+  const platform = detectServicePlatform();
+  if (platform === "unsupported") {
+    fail(
+      "no supervised-service support for this platform yet. Use Task Scheduler / a startup script, or keep `sup listen` running in a terminal.",
+      "unsupported_platform",
+    );
+  }
+
+  const nodeBin = process.execPath;
+  const runArgs = [SELF_PATH, ...buildListenRunArgs(flags)];
+  const pathEnv = process.env.PATH || "/usr/local/bin:/usr/bin:/bin";
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+
+  if (platform === "darwin") {
+    const dir = join(homedir(), "Library", "LaunchAgents");
+    if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+    const plistPath = join(dir, `${SERVICE_LABEL}.plist`);
+    const plist = buildLaunchdPlist({
+      label: SERVICE_LABEL,
+      nodeBin,
+      args: runArgs,
+      logPath: LISTEN_LOG_PATH,
+      pathEnv,
+    });
+    writeFileSync(plistPath, plist, "utf8");
+
+    const uid = currentUid();
+    await runCmd("launchctl", ["bootout", `gui/${uid}/${SERVICE_LABEL}`]);
+    let result = await runCmd("launchctl", [
+      "bootstrap",
+      `gui/${uid}`,
+      plistPath,
+    ]);
+    if (result.code !== 0) {
+      result = await runCmd("launchctl", ["load", "-w", plistPath]);
+    }
+    if (result.code !== 0) {
+      fail(
+        `launchctl failed: ${result.stderr || result.stdout || `exit ${result.code}`}`,
+        "service_install_failed",
+      );
+    }
+    await runCmd("launchctl", ["kickstart", "-k", `gui/${uid}/${SERVICE_LABEL}`]);
+
+    writeServiceState({
+      platform,
+      unitPath: plistPath,
+      label: SERVICE_LABEL,
+      installedAt: new Date().toISOString(),
+    });
+    clearServiceErrorReport();
+    out(
+      `installed supervised listener (darwin): ${plistPath}\nauto-restarts on crash + login. check: sup service status`,
+      { ok: true, installed: true, platform, unit_path: plistPath },
+    );
+    return;
+  }
+
+  const dir = join(homedir(), ".config", "systemd", "user");
+  if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
+  const unitName = "sup-listen.service";
+  const unitPath = join(dir, unitName);
+  const unit = buildSystemdUnit({ nodeBin, args: runArgs, pathEnv });
+  writeFileSync(unitPath, unit, "utf8");
+
+  await runCmd("systemctl", ["--user", "daemon-reload"]);
+  const enableResult = await runCmd("systemctl", [
+    "--user",
+    "enable",
+    "--now",
+    unitName,
+  ]);
+  if (enableResult.code !== 0) {
+    fail(
+      `systemctl failed: ${enableResult.stderr || enableResult.stdout || `exit ${enableResult.code}`}`,
+      "service_install_failed",
+    );
+  }
+
+  writeServiceState({
+    platform,
+    unitPath,
+    label: unitName,
+    installedAt: new Date().toISOString(),
+  });
+  clearServiceErrorReport();
+  out(
+    `installed supervised listener (linux): ${unitPath}\nauto-restarts on crash + login. check: sup service status`,
+    { ok: true, installed: true, platform, unit_path: unitPath },
+  );
+}
+
+async function serviceStatusCheck() {
+  const state = readServiceState();
+  if (!state) return { installed: false };
+  if (!existsSync(state.unitPath)) {
+    return { installed: false, detail: "unit file missing" };
+  }
+  if (state.platform === "darwin") {
+    const uid = currentUid();
+    const result = await runCmd("launchctl", [
+      "print",
+      `gui/${uid}/${state.label}`,
+    ]);
+    const running = result.code === 0 && /state = running/.test(result.stdout);
+    return {
+      installed: true,
+      state,
+      running,
+      detail: result.stdout.split("\n")[0]?.trim(),
+    };
+  }
+  const result = await runCmd("systemctl", ["--user", "is-active", state.label]);
+  const running = result.stdout.trim() === "active";
+  return { installed: true, state, running, detail: result.stdout.trim() };
+}
+
+async function cmdServiceStatus() {
+  const status = await serviceStatusCheck();
+  if (JSON_MODE) {
+    out(undefined, status);
+    return;
+  }
+  if (!status.installed) {
+    out(`service: not installed${status.detail ? ` (${status.detail})` : ""}`);
+    return;
+  }
+  out(
+    `service: installed (${status.state.platform}) — ${status.running ? "running" : "NOT running"}` +
+      (status.detail ? `\n${status.detail}` : ""),
+  );
+}
+
+async function uninstallServiceCmd() {
+  const state = readServiceState();
+  if (!state) {
+    out("no service was installed", { ok: true, installed: false });
+    return;
+  }
+  if (state.platform === "darwin") {
+    const uid = currentUid();
+    await runCmd("launchctl", ["bootout", `gui/${uid}/${state.label}`]);
+  } else {
+    await runCmd("systemctl", ["--user", "disable", "--now", state.label]);
+  }
+  try {
+    rmSync(state.unitPath);
+  } catch {
+    // ignore
+  }
+  clearServiceState();
+  clearServiceErrorReport();
+  out("service uninstalled", { ok: true, uninstalled: true });
+}
+
+/**
+ * Self-heal hook for `sup notify` (the cron backup path). Only acts on a
+ * service the owner already opted into via `sup service install` — never
+ * installs one on its own.
+ */
+async function ensureServiceRunning() {
+  const status = await serviceStatusCheck();
+  if (!status.installed) return { action: "not_installed" };
+  if (status.running) return { action: "already_running" };
+  const state = status.state;
+  if (state.platform === "darwin") {
+    const uid = currentUid();
+    const result = await runCmd("launchctl", [
+      "kickstart",
+      "-k",
+      `gui/${uid}/${state.label}`,
+    ]);
+    return result.code === 0
+      ? { action: "restarted" }
+      : { action: "error", detail: result.stderr || result.stdout || `exit ${result.code}` };
+  }
+  const result = await runCmd("systemctl", ["--user", "restart", state.label]);
+  return result.code === 0
+    ? { action: "restarted" }
+    : { action: "error", detail: result.stderr || result.stdout || `exit ${result.code}` };
+}
+
+async function cmdService(flags, positional) {
+  const sub = positional[0];
+  if (sub === "install") return installService(flags);
+  if (sub === "status") return cmdServiceStatus();
+  if (sub === "uninstall") return uninstallServiceCmd();
+  fail("usage: sup service install|status|uninstall", "usage");
+}
+
 // ---------- help ----------
 
 function cmdHelp() {
@@ -1911,7 +2291,8 @@ Identity:
   sup auth revoke --yes               delete handle + key
 
 Messaging:
-  sup send @peer "message" [--kind text|json|task] [--payload '{…}'] [--grant ID]
+  sup send @peer "message" [--thread thr_…] [--in-reply-to msg_…]
+                           [--kind text|json|task] [--payload '{…}'] [--grant ID]
   sup queue @peer "message"           reach anyone (request+hold if needed)
   sup ask @peer "…" [--wait N]        queue/send + wait (default 60s)
   sup ask --resume [--wait N]         continue wait; always returns timed_out|answered
@@ -1932,6 +2313,9 @@ Messaging:
   sup notify                          peek summary of unread + requests
   sup listen [--notify "cmd"]         durable inbound daemon (pid+log)
   sup listen status | stop            check / stop the listener
+  sup service install [--notify "cmd"]  supervise listen with launchd/systemd
+                                       (auto-restarts on crash, login, reboot)
+  sup service status | uninstall      check / remove the supervised service
   sup events watch [--after CUR]      foreground long-poll (session use)
   sup watch [--timeout N]             alias for events watch
   sup webhook set https://…           push events (HMAC X-Sup-Signature)
@@ -2062,6 +2446,8 @@ async function main() {
       return cmdEvents(flags, positional);
     case "listen":
       return cmdListen(flags, positional);
+    case "service":
+      return cmdService(flags, positional);
     case "webhook":
     case "webhooks":
       return cmdWebhook(flags, positional);

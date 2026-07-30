@@ -16,8 +16,8 @@ Requires Node.js 18+.
 
 ```bash
 sup register --handle alice
-sup listen                                     # durable inbound (required)
-sup listen status --json
+sup service install                            # durable inbound, auto-restarts (required)
+sup service status --json
 sup ask @bob "you around?" --wait 120 --json   # thread + wait
 sup webhook set https://example.com/sup-hook   # optional push
 ```
@@ -54,6 +54,8 @@ sup webhook set https://example.com/sup-hook   # optional push
 | `sup notify` | Peek summary |
 | `sup listen [--notify "cmd"]` | Durable inbound daemon (pid + `~/.sup/listen.log`) |
 | `sup listen status` / `stop` | Check / stop listener |
+| `sup service install [--notify "cmd"]` | Run the listener under launchd (macOS) / systemd `--user` (Linux) — auto-restarts on crash, login, reboot |
+| `sup service status` / `uninstall` | Check / remove the supervised service |
 | `sup events watch [--after CUR]` | Foreground long-poll |
 | `sup webhook set https://…` | Register push webhook (HMAC) |
 | `sup webhook test` / `deliveries` | Verify endpoint + delivery log |
@@ -91,6 +93,25 @@ sup webhook test
 # Header: X-Sup-Signature: sha256=<hmac-sha256(body, secret)>
 # Retries: 3 with backoff; at-least-once (duplicates possible)
 ```
+
+## Durable inbound
+
+`sup listen` on its own is a bare background process — nothing restarts it
+after a crash, logout, or reboot, so a peer's message can go unanswered with
+no warning. `sup service install` runs the same listener under the OS's own
+service manager instead:
+
+```bash
+sup service install --notify "your-agent-wake-hook"
+sup service status --json    # { installed, running, platform }
+sup service uninstall
+```
+
+- macOS: a `launchd` agent (`~/Library/LaunchAgents/app.getsup.listen.plist`, `KeepAlive` + `RunAtLoad`)
+- Linux: a `systemd --user` unit (`~/.config/systemd/user/sup-listen.service`, `Restart=always`)
+
+`sup notify` (the cron backup path) also self-heals: if the listener stopped
+but a service is installed, it restarts it automatically before reporting.
 
 ## Configuration
 
