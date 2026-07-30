@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.10\.0/.test(src), "CLI version bumped");
+assert(/0\.10\.1/.test(src), "CLI version bumped");
 assert(src.includes("ASK_DEFAULT_WAIT_SEC"), "ask default wait constant");
 assert(src.includes('state: "timed_out"') || src.includes("timed_out"), "ask structured timeout");
 assert(src.includes("softTimeout"), "fetch abort soft timeout");
@@ -130,6 +130,27 @@ assert(src.includes("buildListenRunArgs"), "service reuses `sup listen run` args
 assert(
   src.includes('case "service"'),
   "service wired into main() dispatch",
+);
+
+// A container/sandbox reporting `linux` often has no systemd at all — this
+// used to hard-fail `sup service install` there with "no systemctl". Guard
+// the generic restart-loop fallback that fixes it.
+assert(src.includes("hasSystemd"), "detects real systemd vs. just the binary");
+assert(src.includes("/run/systemd/system"), "uses the canonical systemd-is-init check");
+assert(src.includes("linux-generic"), "generic non-systemd Linux fallback exists");
+assert(src.includes("installGenericSupervisor"), "generic restart-loop installer");
+assert(src.includes("spawnSupervisorScript"), "restart re-launches existing script instead of rebuilding args");
+assert(src.includes("installRebootHook") && src.includes("@reboot"), "best-effort reboot survival via cron");
+assert(src.includes("shQuote"), "shell-escapes args embedded in the supervisor script");
+
+// Re-implement the escaping contract (matches the CLI's own shQuote) since
+// sup.mjs runs its CLI on import and can't be required for a direct call.
+function shQuoteContract(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
+}
+assert(
+  shQuoteContract("it's a \"test\" & such") === `'it'\\''s a "test" & such'`,
+  "shQuote contract safely round-trips embedded single quotes",
 );
 
 if (failed) {

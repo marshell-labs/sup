@@ -21,7 +21,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.10.0";
+const VERSION = "0.10.1";
 const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
@@ -1939,14 +1939,29 @@ const SERVICE_LABEL = "app.getsup.listen";
 const SERVICE_STATE_PATH = join(CONFIG_DIR, "service.json");
 const SERVICE_ERROR_PATH = join(CONFIG_DIR, "service-error.json");
 
+function hasSystemd() {
+  // The canonical "is systemd actually running as init" check — many
+  // containers ship the systemctl binary without systemd ever running,
+  // which would otherwise fail loudly on `systemctl --user ...`.
+  return existsSync("/run/systemd/system");
+}
+
+/** `linux-systemd` gets a real unit; `linux-generic` covers containers and
+ * other sandboxes that report `linux` but have no init system to hook into. */
 function detectServicePlatform() {
   if (process.platform === "darwin") return "darwin";
-  if (process.platform === "linux") return "linux";
+  if (process.platform === "linux") {
+    return hasSystemd() ? "linux-systemd" : "linux-generic";
+  }
   return "unsupported";
 }
 
 function currentUid() {
   return typeof process.getuid === "function" ? process.getuid() : 0;
+}
+
+function shQuote(value) {
+  return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
 function readServiceState() {
@@ -2083,6 +2098,106 @@ function runCmd(cmd, args) {
   });
 }
 
+async function readPidFile(path) {
+  try {
+    const pid = Number(readFileSync(path, "utf8").trim());
+    return Number.isFinite(pid) && pid > 0 ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+const CRON_MARKER = "# sup-service-supervisor (auto-managed)";
+
+/**
+ * Best-effort `@reboot` crontab hook so the restart loop comes back after a
+ * real reboot, not just a crash. ponytail: silently no-ops if `crontab`
+ * isn't installed or cron isn't running — the restart loop still covers
+ * crash resilience either way. Upgrade path: a real init system.
+ */
+async function installRebootHook(cronLine) {
+  const existing = await runCmd("crontab", ["-l"]);
+  if (existing.code !== 0 && !/no crontab/i.test(existing.stderr)) {
+    return false;
+  }
+  const kept = existing.code === 0
+    ? existing.stdout.split("\n").filter((line) => line && !line.includes(CRON_MARKER))
+    : [];
+  kept.push(`@reboot ${cronLine} ${CRON_MARKER}`);
+  return writeCrontab(`${kept.join("\n")}\n`);
+}
+
+async function removeRebootHook() {
+  const existing = await runCmd("crontab", ["-l"]);
+  if (existing.code !== 0) return;
+  const kept = existing.stdout.split("\n").filter((line) => line && !line.includes(CRON_MARKER));
+  await writeCrontab(kept.length ? `${kept.join("\n")}\n` : "");
+}
+
+function writeCrontab(content) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn("crontab", ["-"], { env: process.env, stdio: ["pipe", "ignore", "ignore"] });
+    } catch {
+      resolve(false);
+      return;
+    }
+    child.on("close", (code) => resolve(code === 0));
+    child.on("error", () => resolve(false));
+    child.stdin.write(content);
+    child.stdin.end();
+  });
+}
+
+/** (Re)launches an already-written supervisor script — used both for the
+ * initial install and for self-heal restarts, so a restart never has to
+ * regenerate (and risk drifting from) the original --notify/--types args. */
+async function spawnSupervisorScript(scriptPath, pidFile, logPath, pathEnv) {
+  const prevPid = await readPidFile(pidFile);
+  if (prevPid && isPidAlive(prevPid)) {
+    try {
+      process.kill(-prevPid, "SIGTERM");
+    } catch {
+      // already gone
+    }
+  }
+
+  const fd = openSync(logPath, "a");
+  const child = spawn("/bin/sh", [scriptPath], {
+    detached: true,
+    stdio: ["ignore", fd, fd],
+    env: { ...process.env, PATH: pathEnv },
+  });
+  closeSync(fd);
+  child.unref();
+  writeFileSync(pidFile, String(child.pid), "utf8");
+}
+
+async function installGenericSupervisor(nodeBin, args, logPath, pathEnv) {
+  if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+  const scriptPath = join(CONFIG_DIR, "service-supervisor.sh");
+  const pidFile = join(CONFIG_DIR, "service-supervisor.pid");
+  const invocation = [nodeBin, ...args].map(shQuote).join(" ");
+  const script = `#!/bin/sh
+# sup generic supervisor — restarts the listener if it exits.
+# ponytail: no systemd/launchd here, so this is a bare restart loop, not a
+# real init-managed service — it only covers crashes, not host reboots
+# unless the @reboot crontab hook installed alongside this also fires.
+while true; do
+  ${invocation}
+  sleep 2
+done
+`;
+  writeFileSync(scriptPath, script, { mode: 0o700 });
+  await spawnSupervisorScript(scriptPath, pidFile, logPath, pathEnv);
+
+  const cronInstalled = await installRebootHook(
+    `/bin/sh ${shQuote(scriptPath)} >> ${shQuote(logPath)} 2>&1 &`,
+  );
+  return { scriptPath, pidFile, cronInstalled };
+}
+
 async function installService(flags) {
   requireKey(loadConfig());
   const platform = detectServicePlatform();
@@ -2143,6 +2258,31 @@ async function installService(flags) {
     return;
   }
 
+  if (platform === "linux-generic") {
+    const { scriptPath, pidFile, cronInstalled } = await installGenericSupervisor(
+      nodeBin,
+      runArgs,
+      LISTEN_LOG_PATH,
+      pathEnv,
+    );
+    writeServiceState({
+      platform,
+      unitPath: scriptPath,
+      label: "sup-service-supervisor",
+      installedAt: new Date().toISOString(),
+      pidFile,
+      cronInstalled,
+    });
+    clearServiceErrorReport();
+    out(
+      cronInstalled
+        ? `installed supervised listener (linux, no systemd): ${scriptPath}\nrestart-on-crash loop + @reboot crontab hook. check: sup service status`
+        : `installed supervised listener (linux, no systemd): ${scriptPath}\nrestart-on-crash loop only — no cron available, so this will NOT survive a reboot. check: sup service status`,
+      { ok: true, installed: true, platform, unit_path: scriptPath, cron_installed: cronInstalled },
+    );
+    return;
+  }
+
   const dir = join(homedir(), ".config", "systemd", "user");
   if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
   const unitName = "sup-listen.service";
@@ -2197,6 +2337,18 @@ async function serviceStatusCheck() {
       detail: result.stdout.split("\n")[0]?.trim(),
     };
   }
+  if (state.platform === "linux-generic") {
+    const pid = state.pidFile ? await readPidFile(state.pidFile) : null;
+    const running = pid !== null && isPidAlive(pid);
+    return {
+      installed: true,
+      state,
+      running,
+      detail: running
+        ? `restart-loop pid ${pid}${state.cronInstalled ? "" : " (no @reboot hook — won't survive a reboot)"}`
+        : "restart-loop process is gone",
+    };
+  }
   const result = await runCmd("systemctl", ["--user", "is-active", state.label]);
   const running = result.stdout.trim() === "active";
   return { installed: true, state, running, detail: result.stdout.trim() };
@@ -2227,6 +2379,23 @@ async function uninstallServiceCmd() {
   if (state.platform === "darwin") {
     const uid = currentUid();
     await runCmd("launchctl", ["bootout", `gui/${uid}/${state.label}`]);
+  } else if (state.platform === "linux-generic") {
+    const pid = state.pidFile ? await readPidFile(state.pidFile) : null;
+    if (pid && isPidAlive(pid)) {
+      try {
+        process.kill(-pid, "SIGTERM");
+      } catch {
+        // already gone
+      }
+    }
+    if (state.pidFile) {
+      try {
+        rmSync(state.pidFile);
+      } catch {
+        // ignore
+      }
+    }
+    if (state.cronInstalled) await removeRebootHook();
   } else {
     await runCmd("systemctl", ["--user", "disable", "--now", state.label]);
   }
@@ -2260,6 +2429,15 @@ async function ensureServiceRunning() {
     return result.code === 0
       ? { action: "restarted" }
       : { action: "error", detail: result.stderr || result.stdout || `exit ${result.code}` };
+  }
+  if (state.platform === "linux-generic") {
+    try {
+      const pathEnv = process.env.PATH || "/usr/local/bin:/usr/bin:/bin";
+      await spawnSupervisorScript(state.unitPath, state.pidFile, LISTEN_LOG_PATH, pathEnv);
+      return { action: "restarted" };
+    } catch (error) {
+      return { action: "error", detail: error.message };
+    }
   }
   const result = await runCmd("systemctl", ["--user", "restart", state.label]);
   return result.code === 0

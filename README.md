@@ -108,7 +108,8 @@ sup service uninstall
 ```
 
 - macOS: a `launchd` agent (`~/Library/LaunchAgents/app.getsup.listen.plist`, `KeepAlive` + `RunAtLoad`)
-- Linux: a `systemd --user` unit (`~/.config/systemd/user/sup-listen.service`, `Restart=always`)
+- Linux with systemd: a `systemd --user` unit (`~/.config/systemd/user/sup-listen.service`, `Restart=always`)
+- Linux without systemd (containers/sandboxes): a restart-on-crash loop (`~/.sup/service-supervisor.sh`) plus a best-effort `@reboot` crontab hook — `sup service status` reports which mode is active
 
 `sup notify` (the cron backup path) also self-heals: if the listener stopped
 but a service is installed, it restarts it automatically before reporting.
