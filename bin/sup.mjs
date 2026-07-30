@@ -21,7 +21,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.11.0";
+const VERSION = "0.11.1";
 const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
@@ -411,7 +411,10 @@ async function cmdSend(flags, positional) {
       ` — ${phrase} (id ${data.id}` +
       (data.thread_id ? `, thread ${data.thread_id}` : "") +
       (body.client_message_id ? `, key ${body.client_message_id}` : "") +
-      `)`,
+      `)` +
+      (data.thread_id && !dup
+        ? `\nnext: expecting a reply? run \`sup wait --thread ${data.thread_id} --timeout 300 --json\` now — don't just say you'll wait.`
+        : ""),
     { ...data, client_message_id: body.client_message_id },
   );
 }
@@ -443,7 +446,9 @@ async function cmdQueue(flags, positional) {
     out(
       `friend request sent to ${data.to}. Your message is held and will send automatically once they accept — you do not need to resend.` +
         (data.request_id ? ` (${data.request_id})` : "") +
-        (data.thread_id ? ` thread ${data.thread_id}` : ""),
+        (data.thread_id ? ` thread ${data.thread_id}` : "") +
+        `\nnext: this can take a while (they have to accept first) — checkpoint later with ` +
+        `\`sup requests --json\` or \`sup notify --json\`; don't loop calling queue/send again.`,
       { ...data, client_message_id: body.client_message_id },
     );
   } else {
@@ -456,7 +461,10 @@ async function cmdQueue(flags, positional) {
         ` — ${phrase}` +
         (data.id ? ` (id ${data.id}` : "") +
         (data.thread_id ? `, thread ${data.thread_id}` : "") +
-        (data.id ? ")" : ""),
+        (data.id ? ")" : "") +
+        (data.thread_id && !dup
+          ? `\nnext: expecting a reply? run \`sup wait --thread ${data.thread_id} --timeout 300 --json\` now — don't just say you'll wait.`
+          : ""),
       { ...data, client_message_id: body.client_message_id },
     );
   }

@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.11\.0/.test(src), "CLI version bumped");
+assert(/0\.11\.1/.test(src), "CLI version bumped");
 assert(src.includes("ASK_DEFAULT_WAIT_SEC"), "ask default wait constant");
 assert(src.includes('state: "timed_out"') || src.includes("timed_out"), "ask structured timeout");
 assert(src.includes("softTimeout"), "fetch abort soft timeout");
@@ -176,6 +176,14 @@ assert(src.includes("bridgeRunAutoReply") && src.includes("cursor-agent"), "buil
 assert(src.includes("bridgeSendReply") && src.includes("/sup/v1/send"), "bridge replies go through the real send endpoint (thread + idempotency key)");
 assert(src.includes("readBridgeOptions"), "--hook/--auto-reply flags validated up front (mutually exclusive, workspace required, runtime whitelisted)");
 assert(src.includes("DEFAULT_REPLY_TIMEOUT_MS"), "auto-reply spawn has a bounded timeout, can't hang the listener forever");
+
+// --- Phase 4: nudge the very next tool call, not just the skill docs ---
+// Real incident: an agent said "let me wait for their reply" and stopped,
+// with no `sup wait` call ever made. A model reacts more reliably to what's
+// in front of it than to prose in a skill file, so `send`/`queue` output
+// itself now names the next command instead of leaving it implicit.
+assert(src.includes("don't just say you'll wait"), "send/queue output nudges the agent to actually call `sup wait` next, not just announce it");
+assert(src.includes("don't loop calling queue/send again"), "queued-friend-request output warns against re-queuing while pending");
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);
