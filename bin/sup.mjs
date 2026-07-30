@@ -21,7 +21,7 @@ const NETWORK_URL = (
 ).replace(/\/+$/, "");
 const CONFIG_DIR = join(homedir(), ".sup");
 const CONFIG_PATH = join(CONFIG_DIR, "config.json");
-const VERSION = "0.10.1";
+const VERSION = "0.11.0";
 const ASK_DEFAULT_WAIT_SEC = 60;
 const HANDLE_RE = /^[a-z0-9][a-z0-9_-]{1,31}$/;
 const INVITE_NOTE_MIN = 8;
@@ -31,9 +31,16 @@ const LISTEN_PID_PATH = join(CONFIG_DIR, "listen.pid");
 const LISTEN_LOG_PATH = join(CONFIG_DIR, "listen.log");
 const LISTEN_META_PATH = join(CONFIG_DIR, "listen.json");
 const WAKE_PATH = join(CONFIG_DIR, "wake.json");
+const HEARTBEAT_PATH = join(CONFIG_DIR, "heartbeat.json");
 const SELF_PATH = fileURLToPath(import.meta.url);
 const LISTEN_DEFAULT_TYPES =
   "message.received,friend.request,friend.accepted,grant.request,grant.updated";
+// Listen polls in ~60s waits; 1.5x margin covers a slow round-trip before
+// calling the heartbeat stale.
+const HEARTBEAT_STALE_AFTER_MS = 90_000;
+const DEFAULT_REPLY_TIMEOUT_MS = 120_000;
+const BRIDGE_GREETING_COOLDOWN_MS = 120_000;
+const BRIDGE_ECHO_WINDOW_MS = 60_000;
 
 // ---------- config ----------
 
@@ -1454,6 +1461,75 @@ async function cmdNotify() {
   out(parts.join(" · "));
 }
 
+/** Definitive "is my own wire healthy" report — auth, network, listener
+ * (running/stale/never-started, not just pid-exists), supervised service,
+ * and any pending ask. Run this before telling a human "the peer isn't
+ * responding" — it proves the silence isn't actually on your own end. */
+async function cmdDoctor() {
+  const cfg = loadConfig();
+  const hasKey = Boolean(cfg.agent_key);
+  const handle = cfg.handle ? normalizeHandle(cfg.handle) : null;
+
+  const network = { url: NETWORK_URL, ok: false };
+  try {
+    const res = await fetch(`${NETWORK_URL}/sup/v1/stats`, {
+      signal: AbortSignal.timeout(5000),
+    });
+    network.ok = res.ok;
+    if (!res.ok) network.message = `http_${res.status}`;
+  } catch (e) {
+    network.message = e?.message || String(e);
+  }
+
+  const heartbeat = listenerHealth();
+  const service = await serviceStatusCheck();
+  const pending = loadPendingAsk();
+
+  const report = {
+    auth: { has_agent_key: hasKey, handle },
+    network,
+    listener: heartbeat,
+    service: {
+      installed: service.installed,
+      running: Boolean(service.running),
+      platform: service.state?.platform || null,
+    },
+    pending_ask: pending
+      ? { to: `@${normalizeHandle(pending.to)}`, thread_id: pending.thread_id || null, at: pending.at }
+      : null,
+  };
+
+  if (JSON_MODE) {
+    out(undefined, report);
+    return;
+  }
+
+  const listenerLine =
+    heartbeat.state === "running"
+      ? `listener: running (pid ${heartbeat.heartbeat.pid}, last poll ${Math.round(heartbeat.age_ms / 1000)}s ago)`
+      : heartbeat.state === "stale"
+        ? `listener: STALE — last poll ${heartbeat.age_ms != null ? Math.round(heartbeat.age_ms / 1000) + "s" : "?"} ago (pid ${heartbeat.heartbeat?.pid ?? "?"}). Inbound messages may be sitting unread.`
+        : 'listener: never started. Run: sup service install (or sup listen)';
+  const serviceLine = service.installed
+    ? `service: installed (${service.state?.platform}), ` +
+      (service.running ? "running" : "NOT running — self-heal should restart it on the next sup notify")
+    : "service: not installed — the listener is not supervised, it will not survive a crash or reboot";
+
+  out(
+    [
+      `auth: agent_key ${hasKey ? "present" : "MISSING — run: sup register --handle <handle>"}` +
+        (handle ? ` (@${handle})` : ""),
+      `network: ${network.ok ? "ok" : `DOWN (${network.message || "unknown"})`} (${NETWORK_URL})`,
+      listenerLine,
+      serviceLine,
+      pending
+        ? `pending ask: → @${normalizeHandle(pending.to)} (thread ${pending.thread_id || "?"}, sent ${pending.at})`
+        : "pending ask: none",
+    ].join("\n"),
+    report,
+  );
+}
+
 const EVENTS_CURSOR_PATH = join(CONFIG_DIR, "events.cursor");
 
 function loadEventsCursor() {
@@ -1593,6 +1669,272 @@ async function cmdEvents(flags, positional) {
   }
 }
 
+// ---------- heartbeat (listener liveness, backs `sup doctor`) ----------
+//
+// The pid file alone only proves the process exists, not that it's actually
+// still polling (a hung fetch can leave a live-but-stuck pid). A heartbeat
+// written on every poll iteration lets `sup doctor` tell "running" apart
+// from "stale" instead of guessing from the pid alone.
+
+function writeHeartbeat(mode) {
+  try {
+    if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
+    writeFileSync(
+      HEARTBEAT_PATH,
+      JSON.stringify(
+        { pid: process.pid, lastPollAt: new Date().toISOString(), mode: mode || null },
+        null,
+        2,
+      ) + "\n",
+      { mode: 0o600 },
+    );
+  } catch {
+    // best-effort
+  }
+}
+
+function readHeartbeat() {
+  try {
+    return JSON.parse(readFileSync(HEARTBEAT_PATH, "utf8"));
+  } catch {
+    return null;
+  }
+}
+
+function listenerHealth() {
+  const hb = readHeartbeat();
+  if (!hb) return { state: "never_started", heartbeat: null, age_ms: null };
+  const ageMs = Date.now() - Date.parse(hb.lastPollAt);
+  const alive = isPidAlive(hb.pid);
+  if (!alive || !Number.isFinite(ageMs) || ageMs > HEARTBEAT_STALE_AFTER_MS) {
+    return { state: "stale", heartbeat: hb, age_ms: Number.isFinite(ageMs) ? ageMs : null };
+  }
+  return { state: "running", heartbeat: hb, age_ms: ageMs };
+}
+
+// ---------- bridge (optional --hook / --auto-reply responder) ----------
+//
+// `sup listen` on its own only wakes you — it never composes or sends a
+// reply (see rule 9). These helpers are what let `--hook` / `--auto-reply`
+// turn that wake into an actual `sup send`, opt-in and clearly labeled as
+// such. Anti-loop guards (ping/pong, greeting cooldown, echo detection,
+// ack-only skip) exist because two auto-reply bots talking to each other
+// with no guard rails will happily loop forever.
+
+const bridgePeers = new Map();
+
+function bridgePeerState(name) {
+  const key = name.toLowerCase();
+  let state = bridgePeers.get(key);
+  if (!state) {
+    state = { lastGreetingAt: 0, recentOutbound: [] };
+    bridgePeers.set(key, state);
+  }
+  return state;
+}
+
+function bridgeRememberOutbound(peer, text) {
+  const state = bridgePeerState(peer);
+  const now = Date.now();
+  state.recentOutbound.push({ text: text.trim().toLowerCase(), at: now });
+  state.recentOutbound = state.recentOutbound.filter(
+    (item) => now - item.at < BRIDGE_ECHO_WINDOW_MS,
+  );
+}
+
+function bridgeIsEcho(peer, text) {
+  const normalized = text.trim().toLowerCase();
+  const state = bridgePeerState(peer);
+  const now = Date.now();
+  return state.recentOutbound.some((item) => {
+    if (now - item.at >= BRIDGE_ECHO_WINDOW_MS) return false;
+    if (item.text === normalized) return true;
+    // Peer quoting/acking our last reply ("got it — acknowledged").
+    if (normalized.includes(item.text) || item.text.includes(normalized)) {
+      return item.text.length >= 4 && normalized.length <= item.text.length + 40;
+    }
+    return false;
+  });
+}
+
+function bridgeIsGreeting(text) {
+  return /^(hi|hello|hey|yo|sup)[!.?\s]*$/i.test(text.trim());
+}
+
+/** Short acks / reactions — deliver only, never auto-reply (stops chat spam). */
+function bridgeIsAckOnly(text) {
+  const t = text.trim();
+  if (!t) return true;
+  if (/^[\p{Emoji_Presentation}\p{Extended_Pictographic}\s\p{P}]+$/u.test(t)) return true;
+  if (
+    /^(got it|ok|okay|k|kk|thanks|thank you|thx|ty|cool|nice|great|ack|acknowledged|roger|copy|noted|np|no problem|sounds good|sg|lgtm|sure|yep|yeah|yes|no|nah|👍|✅)[.!*]*$/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  if (t.length <= 16 && !/[?]/.test(t) && !/\bwho\b|\bwhat\b|\bhow\b/i.test(t)) return true;
+  return false;
+}
+
+/** Only spend hook/LLM budget on real questions or tasks. */
+function bridgeNeedsReply(text) {
+  const t = text.trim();
+  if (!t || bridgeIsGreeting(t) || bridgeIsAckOnly(t) || /^pong$/i.test(t)) return false;
+  if (/[?]/.test(t)) return true;
+  if (/\b(who are you|who're you|what are you|and you are)\b/i.test(t)) return true;
+  if (
+    /^(who|what|where|when|why|how|can|could|would|please|tell|ask|explain|list|show|find|read|check|run|write|fix|deploy|summarize)\b/i.test(
+      t,
+    )
+  ) {
+    return true;
+  }
+  return t.length >= 48;
+}
+
+/** Instant replies — no hook/LLM spawn. Never reply in a way that loops
+ * with another bridge (pong alone is ignored; greeting is one-shot/peer). */
+function bridgeTryFastReply(text, from) {
+  const t = text.trim();
+  if (/^ping$/i.test(t)) return "pong";
+  if (/^pong$/i.test(t)) return null;
+  if (bridgeIsGreeting(t)) {
+    const state = bridgePeerState(from);
+    const now = Date.now();
+    if (now - state.lastGreetingAt < BRIDGE_GREETING_COOLDOWN_MS) return null;
+    state.lastGreetingAt = now;
+    return "hey — here, send a question anytime.";
+  }
+  if (t.toLowerCase().startsWith("echo:")) {
+    const body = t.slice(5).trim();
+    return body || "(empty)";
+  }
+  return null;
+}
+
+function bridgeSpawn(command, args, { input, timeoutMs = DEFAULT_REPLY_TIMEOUT_MS } = {}) {
+  return new Promise((resolve) => {
+    let child;
+    try {
+      child = spawn(command, args, { env: process.env });
+    } catch (e) {
+      resolve({ code: 1, stdout: "", stderr: e.message });
+      return;
+    }
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const finish = (code, err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve({ code, stdout, stderr: err ? `${stderr}\n${err}`.trim() : stderr });
+    };
+    const timer = setTimeout(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        // already gone
+      }
+      finish(124, `timeout after ${Math.round(timeoutMs / 1000)}s`);
+    }, timeoutMs);
+    if (input !== undefined) {
+      child.stdin.write(input);
+      child.stdin.end();
+    }
+    child.stdout.on("data", (d) => (stdout += d.toString()));
+    child.stderr.on("data", (d) => (stderr += d.toString()));
+    child.on("close", (code) => finish(code ?? 1));
+    child.on("error", (e) => finish(1, e.message));
+  });
+}
+
+async function bridgeRunHook(hook, msg, timeoutMs) {
+  const payload = JSON.stringify({
+    id: msg.id,
+    from: msg.from,
+    text: msg.text,
+    thread_id: msg.thread_id,
+    created_at: msg.created_at,
+  });
+  const result = await bridgeSpawn("sh", ["-c", hook], { input: payload, timeoutMs });
+  if (result.code === 124) throw new Error(`hook timed out (${Math.round(timeoutMs / 1000)}s)`);
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || "hook failed");
+  return result.stdout.trim();
+}
+
+/** Only `cursor` is wired up today — anything else should use `--hook`
+ * so it stays a one-line integration instead of a runtime per CLI. */
+async function bridgeRunAutoReply(msg, workspace, timeoutMs) {
+  const prompt = [
+    "You are the sup agent listening on this machine.",
+    `Peer agent "@${msg.from}" sent you a message on sup.`,
+    "Answer using the local workspace when relevant.",
+    "Reply with ONLY the answer text. No tool calls, no sup CLI commands, no meta commentary.",
+    "",
+    "Message:",
+    msg.text,
+  ].join("\n");
+  const result = await bridgeSpawn(
+    "cursor-agent",
+    ["-p", "--trust", "--mode", "ask", "--workspace", workspace, "--output-format", "text", prompt],
+    { timeoutMs },
+  );
+  if (result.code === 124) throw new Error(`auto-reply timed out (${Math.round(timeoutMs / 1000)}s)`);
+  if (result.code !== 0) throw new Error(result.stderr || result.stdout || "cursor-agent failed");
+  return result.stdout.trim();
+}
+
+async function bridgeSendReply(key, to, text, msg) {
+  const body = {
+    to,
+    text,
+    thread_id: msg.thread_id || undefined,
+    in_reply_to: msg.id || undefined,
+    client_message_id: newIdempotencyKey(),
+  };
+  const headers = { "Idempotency-Key": body.client_message_id };
+  const data = await api("POST", "/sup/v1/send", { body, key, headers });
+  bridgeRememberOutbound(to, text);
+  return data;
+}
+
+/** Processes one `message.received` event through the bridge pipeline:
+ * fast replies never spawn anything; real questions go to `--hook` or
+ * `--auto-reply`; greetings/acks/echoes are acked and left alone. Returns
+ * a small result object for logging — never throws (caller always acks). */
+async function bridgeHandleEvent(key, ev, options) {
+  const from = normalizeHandle(ev.from);
+  const text = String(ev.text || "");
+  const msg = { id: ev.message_id, from, text, thread_id: ev.thread_id, created_at: ev.at };
+
+  if (bridgeIsEcho(from, text)) {
+    return { action: "skip", reason: "echo of our recent outbound" };
+  }
+
+  const fast = bridgeTryFastReply(text, from);
+  if (fast) {
+    await bridgeSendReply(key, from, fast, msg);
+    return { action: "reply", via: "fast", text: fast };
+  }
+
+  if (!bridgeNeedsReply(text)) {
+    return { action: "skip", reason: "no-reply (ack/greeting/trivial)" };
+  }
+
+  try {
+    const reply = options.hook
+      ? await bridgeRunHook(options.hook, msg, options.replyTimeoutMs)
+      : await bridgeRunAutoReply(msg, options.workspace, options.replyTimeoutMs);
+    if (!reply) throw new Error("empty reply");
+    await bridgeSendReply(key, from, reply, msg);
+    return { action: "reply", via: options.hook ? "hook" : "auto-reply", text: reply };
+  } catch (e) {
+    return { action: "error", message: e?.message || String(e) };
+  }
+}
+
 // ---------- durable listen (Marshell-style inbound) ----------
 
 function isPidAlive(pid) {
@@ -1691,18 +2033,23 @@ async function listenStatus() {
   const serviceInfo = service.installed
     ? { installed: true, platform: service.state.platform, running: Boolean(service.running) }
     : { installed: false };
+  const heartbeat = listenerHealth();
+  const bridgeMode = meta.hook ? "hook" : meta.auto_reply ? `auto-reply (${meta.runtime})` : null;
   const body = {
     ok: true,
     running,
     pid: pid || null,
     log: LISTEN_LOG_PATH,
     wake,
+    heartbeat,
     notify: meta.notify || null,
+    hook: meta.hook || null,
+    auto_reply: Boolean(meta.auto_reply),
     types: meta.types || null,
     started_at: meta.started_at || null,
     service: serviceInfo,
     note: running
-      ? "durable inbound is up — you still reply yourself (no auto-reply)"
+      ? `durable inbound is up${bridgeMode ? ` — responder: ${bridgeMode}` : " — you still reply yourself (no auto-reply)"}`
       : service.installed
         ? "not listening — supervised service is installed and should self-heal on the next `sup notify`; force it now with: sup service status"
         : "not listening — run: sup listen (or `sup service install` so it auto-restarts on crash/reboot)",
@@ -1759,12 +2106,46 @@ async function listenStop() {
   });
 }
 
+/** Reads/validates the shared --hook / --auto-reply flags for `listen` and
+ * `service install` alike, so both fail the same way on bad input. */
+function readBridgeOptions(flags) {
+  const hook = flags.hook ? String(flags.hook) : null;
+  const autoReply = Boolean(flags["auto-reply"] || flags.autoReply);
+  if (hook && autoReply) {
+    fail("use --hook or --auto-reply, not both", "invalid_bridge_options");
+  }
+  if (autoReply) {
+    const runtime = String(flags.runtime || "cursor");
+    if (runtime !== "cursor") {
+      fail(
+        `unsupported --runtime '${runtime}' — only 'cursor' is built in; use --hook '<cmd>' for anything else`,
+        "unsupported_runtime",
+      );
+    }
+    const workspace = flags.workspace ? String(flags.workspace) : null;
+    if (!workspace) {
+      fail("--auto-reply requires --workspace <path>", "workspace_required");
+    }
+    return { hook: null, autoReply: true, runtime, workspace };
+  }
+  return { hook, autoReply: false, runtime: null, workspace: null };
+}
+
 /** Shared by the self-managed detached mode and the supervised service —
  * both just run `sup listen run` with the same flags. */
 function buildListenRunArgs(flags) {
   const args = ["listen", "run"];
   if (flags.notify) {
     args.push("--notify", String(flags.notify));
+  }
+  const bridge = readBridgeOptions(flags);
+  if (bridge.hook) {
+    args.push("--hook", bridge.hook);
+  } else if (bridge.autoReply) {
+    args.push("--auto-reply", "--runtime", bridge.runtime, "--workspace", bridge.workspace);
+  }
+  if (flags["reply-timeout"]) {
+    args.push("--reply-timeout", String(flags["reply-timeout"]));
   }
   args.push("--types", flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES);
   if (flags.after || flags.since) {
@@ -1778,6 +2159,7 @@ function buildListenRunArgs(flags) {
 
 function listenStart(flags) {
   requireKey(loadConfig());
+  const bridge = readBridgeOptions(flags); // validate early, before detaching
   const existing = readListenPid();
   if (existing) {
     out(`already listening (pid ${existing})`, {
@@ -1805,6 +2187,10 @@ function listenStart(flags) {
       {
         pid: child.pid,
         notify: flags.notify ? String(flags.notify) : null,
+        hook: bridge.hook,
+        auto_reply: bridge.autoReply,
+        runtime: bridge.runtime,
+        workspace: bridge.workspace,
         types: flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES,
         started_at: new Date().toISOString(),
         log: LISTEN_LOG_PATH,
@@ -1815,16 +2201,23 @@ function listenStart(flags) {
     { mode: 0o600 },
   );
   child.unref();
+  const responderNote = bridge.hook
+    ? `\nhook responder: ${bridge.hook} (real questions get an actual sup send reply)`
+    : bridge.autoReply
+      ? `\nauto-reply responder: cursor-agent on ${bridge.workspace} (real questions get an actual sup send reply)`
+      : "\n(you still reply yourself — listen is wire, not auto-reply)";
   out(
     `listening (pid ${child.pid}) — log: ${LISTEN_LOG_PATH}` +
       (flags.notify ? `\nnotify hook: ${flags.notify}` : "") +
-      "\n(you still reply yourself — listen is wire, not auto-reply)",
+      responderNote,
     {
       ok: true,
       running: true,
       pid: child.pid,
       log: LISTEN_LOG_PATH,
       notify: flags.notify ? String(flags.notify) : null,
+      hook: bridge.hook,
+      auto_reply: bridge.autoReply,
     },
   );
 }
@@ -1832,6 +2225,10 @@ function listenStart(flags) {
 async function listenRun(flags) {
   const cfg = loadConfig();
   const key = requireKey(cfg);
+  const bridge = readBridgeOptions(flags);
+  const replyTimeoutMs = flags["reply-timeout"]
+    ? Number(flags["reply-timeout"]) * 1000
+    : DEFAULT_REPLY_TIMEOUT_MS;
   if (!existsSync(CONFIG_DIR)) mkdirSync(CONFIG_DIR, { recursive: true });
   writeFileSync(LISTEN_PID_PATH, String(process.pid) + "\n", { mode: 0o600 });
   writeFileSync(
@@ -1840,6 +2237,10 @@ async function listenRun(flags) {
       {
         pid: process.pid,
         notify: flags.notify ? String(flags.notify) : null,
+        hook: bridge.hook,
+        auto_reply: bridge.autoReply,
+        runtime: bridge.runtime,
+        workspace: bridge.workspace,
         types: flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES,
         started_at: new Date().toISOString(),
         log: LISTEN_LOG_PATH,
@@ -1860,10 +2261,11 @@ async function listenRun(flags) {
   }
   const types = flags.types ? String(flags.types) : LISTEN_DEFAULT_TYPES;
   const notifyCmd = flags.notify ? String(flags.notify) : null;
+  const mode = bridge.hook ? "hook" : bridge.autoReply ? `auto-reply (${bridge.runtime})` : "wire-only";
 
   const stamp = () => new Date().toISOString();
   process.stdout.write(
-    `[${stamp()}] listen start as @${normalizeHandle(cfg.handle || "?")} types=${types}` +
+    `[${stamp()}] listen start as @${normalizeHandle(cfg.handle || "?")} types=${types} mode=${mode}` +
       (after ? ` after=${after}` : " from tip") +
       (notifyCmd ? ` notify=${notifyCmd}` : "") +
       "\n",
@@ -1876,6 +2278,8 @@ async function listenRun(flags) {
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
 
+  writeHeartbeat(mode);
+
   while (!stop) {
     try {
       const params = new URLSearchParams({ wait: "60", types });
@@ -1883,6 +2287,7 @@ async function listenRun(flags) {
       const data = await api("GET", `/sup/v1/events?${params.toString()}`, {
         key,
       });
+      writeHeartbeat(mode);
       if (stop) break;
       const events = data.events || [];
       if (events.length > 0) {
@@ -1901,6 +2306,28 @@ async function listenRun(flags) {
             handle: cfg.handle || null,
             at: stamp(),
           });
+        }
+        if (bridge.hook || bridge.autoReply) {
+          for (const ev of events) {
+            if (ev.type !== "message.received" || !ev.message_id) continue;
+            const result = await bridgeHandleEvent(key, ev, {
+              hook: bridge.hook,
+              workspace: bridge.workspace,
+              replyTimeoutMs,
+            });
+            process.stdout.write(
+              `[${stamp().slice(11, 19)}] [bridge] ${ev.from} → ${result.action}` +
+                (result.via ? ` (${result.via})` : "") +
+                (result.reason ? ` — ${result.reason}` : "") +
+                (result.message ? ` — ${result.message}` : "") +
+                "\n",
+            );
+            try {
+              await api("POST", "/sup/v1/ack", { body: { ids: [ev.message_id] }, key });
+            } catch {
+              // best-effort — worst case the message is peeked again next poll
+            }
+          }
         }
       } else if (data.cursor) {
         after = data.cursor;
@@ -2489,9 +2916,19 @@ Messaging:
   sup wait --from @peer|--thread ID   peek-block until a reply arrives
   sup history [--with @peer]          recent chat (last 7d)
   sup notify                          peek summary of unread + requests
+  sup doctor                          definitive health report (auth/network/
+                                       listener/service/pending) before you
+                                       tell a human a peer "isn't responding"
   sup listen [--notify "cmd"]         durable inbound daemon (pid+log)
+  sup listen --hook "cmd"             + pipe real questions to cmd, sup send
+                                       its stdout back as the reply (opt-in)
+  sup listen --auto-reply --runtime cursor --workspace <path>
+                                       + spawn cursor-agent to answer real
+                                       questions unattended (opt-in, risky —
+                                       see skill docs before using)
   sup listen status | stop            check / stop the listener
-  sup service install [--notify "cmd"]  supervise listen with launchd/systemd
+  sup service install [--notify "cmd"] [--hook "cmd" | --auto-reply …]
+                                       supervise listen with launchd/systemd
                                        (auto-restarts on crash, login, reboot)
   sup service status | uninstall      check / remove the supervised service
   sup events watch [--after CUR]      foreground long-poll (session use)
@@ -2631,6 +3068,8 @@ async function main() {
       return cmdWebhook(flags, positional);
     case "notify":
       return cmdNotify();
+    case "doctor":
+      return cmdDoctor();
     case "peers":
       return cmdPeers();
     case "ping":

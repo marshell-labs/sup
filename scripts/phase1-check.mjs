@@ -85,7 +85,7 @@ assert(src.includes("note_required"), "CLI enforces invite note");
 assert(src.includes("sup_message"), "CLI has envelope source");
 assert(src.includes("/sup/v1/events"), "CLI calls events endpoint");
 assert(src.includes("peek"), "CLI defaults to peek");
-assert(/0\.10\.1/.test(src), "CLI version bumped");
+assert(/0\.11\.0/.test(src), "CLI version bumped");
 assert(src.includes("ASK_DEFAULT_WAIT_SEC"), "ask default wait constant");
 assert(src.includes('state: "timed_out"') || src.includes("timed_out"), "ask structured timeout");
 assert(src.includes("softTimeout"), "fetch abort soft timeout");
@@ -152,6 +152,30 @@ assert(
   shQuoteContract("it's a \"test\" & such") === `'it'\\''s a "test" & such'`,
   "shQuote contract safely round-trips embedded single quotes",
 );
+
+// --- Phase 3: `sup doctor` + opt-in auto-reply bridge for `sup listen` ---
+// Two gaps found comparing against marshell's CLI: (1) no single command
+// proves "my own wire is healthy" before blaming a quiet peer, (2) no real
+// unattended responder — `sup listen` only ever woke a human/hook, never
+// generated a reply itself.
+assert(src.includes("async function cmdDoctor"), "doctor command exists");
+assert(src.includes('case "doctor"'), "doctor wired into main() dispatch");
+assert(src.includes("listenerHealth"), "doctor reuses listener heartbeat health");
+assert(src.includes("HEARTBEAT_PATH") && src.includes("writeHeartbeat"), "heartbeat file written by the listener loop");
+assert(src.includes("HEARTBEAT_STALE_AFTER_MS"), "heartbeat staleness threshold defined");
+assert(src.includes('"never_started"') && src.includes('"stale"') && src.includes('"running"'), "listener health has three distinct states, not just pid-alive");
+
+assert(src.includes("bridgeHandleEvent"), "bridge event pipeline exists");
+assert(src.includes("bridgeIsEcho") && src.includes("BRIDGE_ECHO_WINDOW_MS"), "echo detection guards against replying to our own message bouncing back");
+assert(src.includes("bridgeIsGreeting") && src.includes("BRIDGE_GREETING_COOLDOWN_MS"), "greeting cooldown avoids re-triggering on every hello");
+assert(src.includes("bridgeIsAckOnly"), "ack-only messages (ok/thanks/emoji) don't trigger a reply");
+assert(src.includes("bridgeNeedsReply"), "needsReply gate before spawning a hook/LLM");
+assert(src.includes("bridgeTryFastReply"), "ping/pong fast-path avoids a hook/LLM round-trip");
+assert(src.includes("bridgeRunHook"), "custom --hook responder");
+assert(src.includes("bridgeRunAutoReply") && src.includes("cursor-agent"), "built-in cursor-agent auto-reply responder");
+assert(src.includes("bridgeSendReply") && src.includes("/sup/v1/send"), "bridge replies go through the real send endpoint (thread + idempotency key)");
+assert(src.includes("readBridgeOptions"), "--hook/--auto-reply flags validated up front (mutually exclusive, workspace required, runtime whitelisted)");
+assert(src.includes("DEFAULT_REPLY_TIMEOUT_MS"), "auto-reply spawn has a bounded timeout, can't hang the listener forever");
 
 if (failed) {
   console.error(`\n${failed} check(s) failed`);
