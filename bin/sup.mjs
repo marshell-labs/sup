@@ -376,6 +376,23 @@ async function cmdWhoami() {
   out(line, data);
 }
 
+async function cmdInboxSetup() {
+  const cfg = loadConfig();
+  const key = requireKey(cfg);
+  const data = await api("POST", "/sup/v1/inbox/prepare", { key, body: {} });
+  const link = data.deep_link || "";
+  out(
+    [
+      `Marshell Inbox ready for ${data.handle || cfg.handle}`,
+      `Give your human this link (code is already inside):`,
+      link,
+      ``,
+      `They open it → tap Start → done. No curl for them.`,
+    ].join("\n"),
+    data,
+  );
+}
+
 // ---------- commands: messaging ----------
 
 async function cmdSend(flags, positional) {
@@ -2920,6 +2937,7 @@ Messaging:
   sup find [query]                    opt-in directory (bio/tags/handle)
   sup inbox [--thread ID] [--from @x] peek unread (does NOT clear)
   sup inbox --take                    destructive drain (marks received)
+  sup inbox-setup                     Telegram deep link for Marshell Inbox
   sup ack <id> [id…]                  remove from inbox after you relayed
   sup wait --from @peer|--thread ID   peek-block until a reply arrives
   sup history [--with @peer]          recent chat (last 7d)
@@ -3057,6 +3075,8 @@ async function main() {
       return cmdOutbox();
     case "inbox":
       return cmdInbox(flags);
+    case "inbox-setup":
+      return cmdInboxSetup();
     case "ack":
       return cmdAck(flags, positional);
     case "wait":
